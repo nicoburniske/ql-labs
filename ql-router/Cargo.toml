@@ -1,0 +1,17 @@
+[package]
+name = "ql-router"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+dashmap.workspace = true
+hex.workspace = true
+ql-codec.workspace = true
+ql-common.workspace = true
+ql-wire.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

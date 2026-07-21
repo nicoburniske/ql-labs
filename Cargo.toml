@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["desktop-relay", "foundation-server", "ql-router"]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1"
+async-channel = "2"
+blit = { git = "https://github.com/nicoburniske/blit.git" }
+blit-cpu = { git = "https://github.com/nicoburniske/blit.git" }
+blit-desktop = { git = "https://github.com/nicoburniske/blit.git" }
+btleplug = "0.11"
+btp = { path = "../foundation-api/btp" }
+dashmap = "6"
+fontdb = "0.23"
+futures-lite = "2.6"
+hex = "0.4"
+ql-api = { path = "../foundation-api/ql-api" }
+ql-codec = { path = "../foundation-api/ql-codec" }
+ql-common = { path = "../foundation-api/ql-common" }
+ql-fsm = { path = "../foundation-api/ql-fsm" }
+ql-router = { path = "ql-router" }
+ql-keyos = { path = "../foundation-api/ql-keyos" }
+ql-rpc = { path = "../foundation-api/ql-rpc" }
+ql-runtime = { path = "../foundation-api/ql-runtime", features = ["rpc"] }
+ql-wire = { path = "../foundation-api/ql-wire", features = ["test-utils"] }
+rxing = { version = "0.7.1", default-features = false }
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+url = "2"
+uuid = "1"
+v4l = "0.14"

@@ -1,0 +1,28 @@
+[package]
+name = "desktop-relay"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+blit.workspace = true
+blit-cpu.workspace = true
+blit-desktop.workspace = true
+btleplug.workspace = true
+btp.workspace = true
+fontdb.workspace = true
+futures-lite.workspace = true
+hex.workspace = true
+ql-codec.workspace = true
+ql-api.workspace = true
+ql-common.workspace = true
+ql-fsm.workspace = true
+ql-router.workspace = true
+ql-runtime.workspace = true
+ql-wire.workspace = true
+rxing.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+v4l.workspace = true
