@@ -12,10 +12,10 @@ ql-api.workspace = true
 ql-codec.workspace = true
 ql-common.workspace = true
 ql-fsm.workspace = true
-ql-keyos.workspace = true
-ql-rpc.workspace = true
+ql-keyos = { git = "https://github.com/Foundation-Devices/foundation-api.git", branch = "ql-v2-shared-api" }
+ql-rpc = { git = "https://github.com/Foundation-Devices/foundation-api.git", branch = "ql-v2-shared-api" }
 ql-router.workspace = true
 ql-runtime = { workspace = true, features = ["rpc"] }
 ql-wire.workspace = true
-sha2.workspace = true
+sha2 = "0.10"
 tokio.workspace = true

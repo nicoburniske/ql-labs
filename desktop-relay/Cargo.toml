@@ -5,27 +5,27 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-async-channel.workspace = true
 anyhow.workspace = true
-blit.workspace = true
-blit-cpu.workspace = true
-blit-desktop.workspace = true
-btleplug.workspace = true
-btp.workspace = true
-fontdb.workspace = true
-futures-lite.workspace = true
+async-channel.workspace = true
+blit = { git = "https://github.com/nicoburniske/blit.git" }
+blit-cpu = { git = "https://github.com/nicoburniske/blit.git" }
+blit-desktop = { git = "https://github.com/nicoburniske/blit.git" }
+btleplug = "0.11"
+btp = { git = "https://github.com/Foundation-Devices/foundation-api.git", branch = "ql-v2-shared-api" }
+fontdb = "0.23"
+futures-lite = "2.6"
 hex.workspace = true
-ql-codec.workspace = true
 ql-api.workspace = true
+ql-codec.workspace = true
 ql-common.workspace = true
 ql-fsm.workspace = true
 ql-router.workspace = true
 ql-runtime.workspace = true
 ql-wire.workspace = true
-rxing.workspace = true
+rxing = { version = "0.9.1", default-features = false, features = ["decoders", "encoding_rs", "qrcode"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-url.workspace = true
-uuid.workspace = true
-v4l.workspace = true
+url = "2"
+uuid = "1"
+v4l = "0.14"
