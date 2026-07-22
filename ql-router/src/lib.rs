@@ -3,95 +3,71 @@ use std::{io, sync::Arc, time::Duration};
 use ql_codec::{Decode, Encode};
 use ql_wire::{
     HandshakeId, IkHandshake, PeerBundle, QlHandshakeRecord, RecordHeader, RecordType, RouteHeader,
-    SoftwareCrypto, TransportParams, generate_identity,
+    SessionKey, SoftwareCrypto, TransportParams, generate_identity,
 };
 use tokio::{
     net::{TcpStream, ToSocketAddrs, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
     time::{Instant, timeout},
 };
 
-use crate::protocol::{Frame, PacketKind, ReplayWindow};
+use crate::protocol::PacketKind;
 
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1:7447";
+pub const DEFAULT_UDP_PAYLOAD: usize = 1200;
 pub const MAX_RECORD_SIZE: usize = 8 * 1024;
-
-#[derive(Debug, Clone, Copy)]
-pub struct UdpConfig {
-    pub max_payload: usize,
-}
-
-impl Default for UdpConfig {
-    fn default() -> Self {
-        Self { max_payload: 1200 }
-    }
-}
 
 pub struct Receiver {
     tcp: OwnedReadHalf,
     udp: UdpReceiver,
-    control: ControlReceiver,
+    tcp_key: SessionKey,
+    next_tcp_packet: u64,
 }
 
 pub struct Sender {
     tcp: OwnedWriteHalf,
     udp: UdpSender,
-    control: ControlSender,
+    tcp_key: SessionKey,
+    next_tcp_packet: u64,
+    tcp_buffer: Vec<u8>,
 }
 
 struct UdpReceiver {
     socket: Arc<UdpSocket>,
     session_id: u64,
-    key: ql_wire::SessionKey,
-    replay: ReplayWindow,
+    key: SessionKey,
     buffer: Vec<u8>,
 }
 
 struct UdpSender {
     socket: Arc<UdpSocket>,
     session_id: u64,
-    key: ql_wire::SessionKey,
+    key: SessionKey,
     next_packet: u64,
     max_payload: usize,
     active: bool,
     buffer: Vec<u8>,
 }
 
-struct ControlSender {
-    session_id: u64,
-    key: ql_wire::SessionKey,
-    next_packet: u64,
-}
-
-struct ControlReceiver {
-    session_id: u64,
-    key: ql_wire::SessionKey,
-    replay: ReplayWindow,
-}
-
 pub async fn connect_udp(
     address: impl ToSocketAddrs,
     router: &PeerBundle,
 ) -> io::Result<(Receiver, Sender)> {
-    connect_udp_with_config(address, router, UdpConfig::default()).await
+    connect_udp_with_max_payload(address, router, DEFAULT_UDP_PAYLOAD).await
 }
 
-pub async fn connect_udp_with_config(
+pub async fn connect_udp_with_max_payload(
     address: impl ToSocketAddrs,
     router: &PeerBundle,
-    config: UdpConfig,
+    max_payload: usize,
 ) -> io::Result<(Receiver, Sender)> {
-    if !(protocol::PACKET_OVERHEAD + RecordHeader::WIRE_SIZE
-        ..=MAX_RECORD_SIZE + protocol::PACKET_OVERHEAD)
-        .contains(&config.max_payload)
-    {
+    if !(protocol::MIN_UDP_PAYLOAD..=protocol::MAX_UDP_PAYLOAD).contains(&max_payload) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid UDP payload limit",
         ));
     }
 
-    let crypto = SoftwareCrypto;
-    router.validate(&crypto).map_err(invalid_data)?;
+    router.validate(&SoftwareCrypto).map_err(invalid_data)?;
     let mut tcp = TcpStream::connect(address).await?;
     tcp.set_nodelay(true)?;
     let peer = tcp.peer_addr()?;
@@ -105,39 +81,33 @@ pub async fn connect_udp_with_config(
     );
     udp.connect(peer).await?;
 
-    let identity = generate_identity(&crypto, "QL router transport");
+    let identity = generate_identity(&SoftwareCrypto, "QL router transport");
     let route = RouteHeader {
         sender: identity.qid,
         recipient: router.qid,
     };
     let mut handshake = IkHandshake::new_ik_initiator(
-        &crypto,
+        &SoftwareCrypto,
         identity,
         router.clone(),
         TransportParams::default(),
     );
     let mut random = [0; 4];
-    ql_wire::QlRandom::fill_random_bytes(&crypto, &mut random);
+    ql_wire::QlRandom::fill_random_bytes(&SoftwareCrypto, &mut random);
     let handshake_id = HandshakeId(u32::from_be_bytes(random));
     let request = ql_wire::encode_record_vec(
         RecordHeader::new(route, RecordType::Handshake),
         &QlHandshakeRecord::Ik1(
             handshake
-                .write_1(&crypto, handshake_id)
+                .write_1(&SoftwareCrypto, handshake_id)
                 .map_err(invalid_data)?,
         ),
     );
-    protocol::send_frame(&mut tcp, &Frame::TransportInit(request)).await?;
+    protocol::write_frame(&mut tcp, &request).await?;
 
-    let Frame::TransportResponse(response) = protocol::receive_frame(&mut tcp)
+    let response = protocol::read_frame(&mut tcp)
         .await?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "router disconnected"))?
-    else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unexpected transport handshake frame",
-        ));
-    };
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "router disconnected"))?;
     if response.len() < 12 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -146,10 +116,7 @@ pub async fn connect_udp_with_config(
     }
     let session_id = u64::from_be_bytes(response[..8].try_into().unwrap());
     let router_max_payload = u32::from_be_bytes(response[8..12].try_into().unwrap()) as usize;
-    if !(protocol::PACKET_OVERHEAD + RecordHeader::WIRE_SIZE
-        ..=MAX_RECORD_SIZE + protocol::PACKET_OVERHEAD)
-        .contains(&router_max_payload)
-    {
+    if !(protocol::MIN_UDP_PAYLOAD..=protocol::MAX_UDP_PAYLOAD).contains(&router_max_payload) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid router UDP payload limit",
@@ -164,35 +131,36 @@ pub async fn connect_udp_with_config(
         ));
     };
     handshake
-        .read_2(&crypto, header.route, &response)
+        .read_2(&SoftwareCrypto, header.route, &response)
         .map_err(invalid_data)?;
-    let finalized = handshake.finalize(&crypto).map_err(invalid_data)?;
+    let finalized = handshake.finalize(&SoftwareCrypto).map_err(invalid_data)?;
     if finalized.remote_bundle != *router {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "transport peer does not match router",
         ));
     }
-    let keys = protocol::derive_keys(&finalized);
+    let udp_keys = protocol::derive_udp_keys(&finalized);
+    let tcp_tx = finalized.tx_key;
+    let tcp_rx = finalized.rx_key;
 
     let confirmation = protocol::seal_packet(
-        &keys.control_tx,
+        &tcp_tx,
         PacketKind::Confirm,
         session_id,
         0,
-        &(config.max_payload as u32).to_be_bytes(),
+        &(max_payload as u32).to_be_bytes(),
     );
-    protocol::send_frame(&mut tcp, &Frame::Authenticated(confirmation)).await?;
+    protocol::write_frame(&mut tcp, &confirmation).await?;
 
     let mut udp_packet: u64 = 0;
-    let mut control_replay = ReplayWindow::default();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let next_packet = udp_packet
             .checked_add(1)
             .ok_or_else(|| io::Error::other("UDP packet number exhausted during activation"))?;
         let bind =
-            protocol::seal_packet(&keys.udp_tx, PacketKind::Bind, session_id, udp_packet, &[]);
+            protocol::seal_packet(&udp_keys.tx, PacketKind::Bind, session_id, udp_packet, &[]);
         udp_packet = next_packet;
         udp.send(&bind).await?;
 
@@ -205,23 +173,21 @@ pub async fn connect_udp_with_config(
         }
         match timeout(
             remaining.min(Duration::from_millis(250)),
-            protocol::receive_frame(&mut tcp),
+            protocol::read_frame(&mut tcp),
         )
         .await
         {
-            Ok(Ok(Some(Frame::Authenticated(packet)))) => {
-                let packet = protocol::open_packet(&keys.control_rx, session_id, &packet)?;
+            Ok(Ok(Some(packet))) => {
+                let packet = protocol::open_packet(&tcp_rx, session_id, &packet)?;
                 if packet.kind == PacketKind::UdpReady
                     && packet.payload.is_empty()
-                    && control_replay.accept(packet.number)
+                    && packet.number == 0
                 {
                     break;
                 }
-            }
-            Ok(Ok(Some(_))) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "unexpected frame during UDP activation",
+                    "unexpected packet during UDP activation",
                 ));
             }
             Ok(Ok(None)) => {
@@ -242,61 +208,61 @@ pub async fn connect_udp_with_config(
             udp: UdpReceiver {
                 socket: udp.clone(),
                 session_id,
-                key: keys.udp_rx,
-                replay: ReplayWindow::default(),
-                buffer: vec![0; config.max_payload],
+                key: udp_keys.rx,
+                buffer: vec![0; max_payload],
             },
-            control: ControlReceiver {
-                session_id,
-                key: keys.control_rx,
-                replay: control_replay,
-            },
+            tcp_key: tcp_rx,
+            next_tcp_packet: 1,
         },
         Sender {
             tcp: writer,
             udp: UdpSender {
                 socket: udp,
                 session_id,
-                key: keys.udp_tx,
+                key: udp_keys.tx,
                 next_packet: udp_packet,
                 max_payload: router_max_payload,
                 active: true,
                 buffer: Vec::with_capacity(router_max_payload),
             },
-            control: ControlSender {
-                session_id,
-                key: keys.control_tx,
-                next_packet: 1,
-            },
+            tcp_key: tcp_tx,
+            next_tcp_packet: 1,
+            tcp_buffer: Vec::new(),
         },
     ))
 }
 
 pub async fn receive(receiver: &mut Receiver) -> io::Result<Option<Vec<u8>>> {
-    let Receiver { tcp, udp, control } = receiver;
+    let Receiver {
+        tcp,
+        udp,
+        tcp_key,
+        next_tcp_packet,
+    } = receiver;
     loop {
         tokio::select! {
-            frame = protocol::receive_frame(tcp) => match frame? {
-                Some(Frame::Record(record)) => return Ok(Some(record)),
-                Some(Frame::Authenticated(packet)) => {
-                    let packet = protocol::open_packet(&control.key, control.session_id, &packet)?;
-                    if packet.kind == PacketKind::UdpReady
-                        && packet.payload.is_empty()
-                        && control.replay.accept(packet.number)
-                    {
-                        continue;
-                    }
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected router control"));
+            frame = protocol::read_frame(tcp) => {
+                let Some(frame) = frame? else { return Ok(None) };
+                let (kind, number, payload) =
+                    protocol::open_packet_owned(tcp_key, udp.session_id, frame)?;
+                let following_packet = next_tcp_packet.checked_add(1)
+                    .ok_or_else(|| io::Error::other("TCP packet number exhausted"))?;
+                if number != *next_tcp_packet {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected TCP packet number"));
                 }
-                Some(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected router frame")),
-                None => return Ok(None),
-            },
+                *next_tcp_packet = following_packet;
+                match kind {
+                    PacketKind::Record => return Ok(Some(payload)),
+                    PacketKind::UdpReady if payload.is_empty() => continue,
+                    _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected router packet")),
+                }
+            }
             received = udp.socket.recv(&mut udp.buffer) => {
                 let len = received?;
                 let Ok(packet) = protocol::open_packet(&udp.key, udp.session_id, &udp.buffer[..len]) else {
                     continue;
                 };
-                if packet.kind == PacketKind::Record && udp.replay.accept(packet.number) {
+                if packet.kind == PacketKind::Record {
                     return Ok(Some(packet.payload.to_vec()));
                 }
             }
@@ -332,25 +298,29 @@ pub async fn send(sender: &mut Sender, record: &[u8]) -> io::Result<()> {
         }
         udp.active = false;
     }
-    protocol::send_frame(&mut sender.tcp, &Frame::Record(record.to_vec())).await
+    send_tcp_packet(sender, PacketKind::Record, record).await
 }
 
 pub async fn attach(sender: &mut Sender, bundle: &PeerBundle) -> io::Result<()> {
     let payload = bundle.encode_vec();
-    let control = &mut sender.control;
-    let next_packet = control
-        .next_packet
+    send_tcp_packet(sender, PacketKind::Attach, &payload).await
+}
+
+async fn send_tcp_packet(sender: &mut Sender, kind: PacketKind, payload: &[u8]) -> io::Result<()> {
+    let next_packet = sender
+        .next_tcp_packet
         .checked_add(1)
-        .ok_or_else(|| io::Error::other("control packet number exhausted"))?;
-    let packet = protocol::seal_packet(
-        &control.key,
-        PacketKind::Attach,
-        control.session_id,
-        control.next_packet,
-        &payload,
+        .ok_or_else(|| io::Error::other("TCP packet number exhausted"))?;
+    protocol::seal_packet_into(
+        &mut sender.tcp_buffer,
+        &sender.tcp_key,
+        kind,
+        sender.udp.session_id,
+        sender.next_tcp_packet,
+        payload,
     );
-    control.next_packet = next_packet;
-    protocol::send_frame(&mut sender.tcp, &Frame::Authenticated(packet)).await
+    sender.next_tcp_packet = next_packet;
+    protocol::write_frame(&mut sender.tcp, &sender.tcp_buffer).await
 }
 
 fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
@@ -362,7 +332,8 @@ pub mod protocol {
 
     use hkdf::Hkdf;
     use ql_wire::{
-        ENCRYPTED_MESSAGE_AUTH_SIZE, FinalizedHandshake, Nonce, QlAead, SessionKey, SoftwareCrypto,
+        ENCRYPTED_MESSAGE_AUTH_SIZE, FinalizedHandshake, Nonce, QlAead, RecordHeader, RecordType,
+        SessionKey, SoftwareCrypto,
     };
     use sha2::Sha256;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -370,23 +341,14 @@ pub mod protocol {
     use crate::MAX_RECORD_SIZE;
 
     pub const PACKET_OVERHEAD: usize = 1 + 8 + 8 + ENCRYPTED_MESSAGE_AUTH_SIZE;
+    pub const MIN_UDP_PAYLOAD: usize = PACKET_OVERHEAD + ql_wire::RecordHeader::WIRE_SIZE;
+    pub const MAX_UDP_PAYLOAD: usize = PACKET_OVERHEAD + MAX_RECORD_SIZE;
 
-    const DATA_FRAME: u8 = 1;
-    const TRANSPORT_INIT_FRAME: u8 = 3;
-    const TRANSPORT_RESPONSE_FRAME: u8 = 4;
-    const AUTHENTICATED_FRAME: u8 = 5;
-    const FRAME_HEADER_SIZE: usize = 5;
+    const FRAME_HEADER_SIZE: usize = 4;
+    const MAX_FRAME_SIZE: usize = MAX_RECORD_SIZE + PACKET_OVERHEAD;
     const PACKET_VERSION: u8 = 1;
     const PACKET_HEADER_SIZE: usize = PACKET_OVERHEAD - ENCRYPTED_MESSAGE_AUTH_SIZE;
-    const CONTROL_KEY_INFO: &[u8] = b"ql-router:transport-keys:v1:control";
     const UDP_KEY_INFO: &[u8] = b"ql-router:transport-keys:v1:udp";
-
-    pub enum Frame {
-        Record(Vec<u8>),
-        TransportInit(Vec<u8>),
-        TransportResponse(Vec<u8>),
-        Authenticated(Vec<u8>),
-    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(u8)]
@@ -404,46 +366,12 @@ pub mod protocol {
         pub payload: &'a [u8],
     }
 
-    pub struct TransportKeys {
-        pub control_tx: SessionKey,
-        pub control_rx: SessionKey,
-        pub udp_tx: SessionKey,
-        pub udp_rx: SessionKey,
+    pub struct UdpKeys {
+        pub tx: SessionKey,
+        pub rx: SessionKey,
     }
 
-    #[derive(Default)]
-    pub struct ReplayWindow {
-        largest: Option<u64>,
-        bitmap: u64,
-    }
-
-    impl ReplayWindow {
-        pub fn accept(&mut self, number: u64) -> bool {
-            let Some(largest) = self.largest else {
-                self.largest = Some(number);
-                self.bitmap = 1;
-                return true;
-            };
-            if number > largest {
-                let shift = number - largest;
-                self.bitmap = if shift >= 64 {
-                    1
-                } else {
-                    (self.bitmap << shift) | 1
-                };
-                self.largest = Some(number);
-                return true;
-            }
-            let shift = largest - number;
-            if shift >= 64 || self.bitmap & (1 << shift) != 0 {
-                return false;
-            }
-            self.bitmap |= 1 << shift;
-            true
-        }
-    }
-
-    pub fn derive_keys(handshake: &FinalizedHandshake) -> TransportKeys {
+    pub fn derive_udp_keys(handshake: &FinalizedHandshake) -> UdpKeys {
         let derive = |key: &SessionKey, info: &[u8]| {
             let hkdf = Hkdf::<Sha256>::new(Some(&handshake.handshake_hash), key.as_bytes());
             let mut out = [0; SessionKey::SIZE];
@@ -451,11 +379,9 @@ pub mod protocol {
                 .expect("fixed transport key size");
             SessionKey(out)
         };
-        TransportKeys {
-            control_tx: derive(&handshake.tx_key, CONTROL_KEY_INFO),
-            control_rx: derive(&handshake.rx_key, CONTROL_KEY_INFO),
-            udp_tx: derive(&handshake.tx_key, UDP_KEY_INFO),
-            udp_rx: derive(&handshake.rx_key, UDP_KEY_INFO),
+        UdpKeys {
+            tx: derive(&handshake.tx_key, UDP_KEY_INFO),
+            rx: derive(&handshake.rx_key, UDP_KEY_INFO),
         }
     }
 
@@ -485,10 +411,11 @@ pub mod protocol {
         packet.extend_from_slice(&session_id.to_be_bytes());
         packet.extend_from_slice(&number.to_be_bytes());
         packet.extend_from_slice(payload);
+        let authenticated_len = authenticated_prefix_len(kind, payload);
         let tag = SoftwareCrypto.aes256_gcm_encrypt(
             key,
             &Nonce::from_counter(number),
-            packet.as_slice(),
+            &packet[..authenticated_len],
             &mut [],
         );
         packet.extend_from_slice(&tag);
@@ -525,10 +452,11 @@ pub mod protocol {
         let tag_at = packet.len() - ENCRYPTED_MESSAGE_AUTH_SIZE;
         let mut tag = [0; ENCRYPTED_MESSAGE_AUTH_SIZE];
         tag.copy_from_slice(&packet[tag_at..]);
+        let authenticated_len = authenticated_prefix_len(kind, &packet[PACKET_HEADER_SIZE..tag_at]);
         if !SoftwareCrypto.aes256_gcm_decrypt(
             key,
             &Nonce::from_counter(number),
-            &packet[..tag_at],
+            &packet[..authenticated_len],
             &mut [],
             &tag,
         ) {
@@ -544,14 +472,39 @@ pub mod protocol {
         })
     }
 
-    pub async fn receive_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Frame>> {
+    pub fn open_packet_owned(
+        key: &SessionKey,
+        expected_session_id: u64,
+        mut packet: Vec<u8>,
+    ) -> io::Result<(PacketKind, u64, Vec<u8>)> {
+        let opened = open_packet(key, expected_session_id, &packet)?;
+        let kind = opened.kind;
+        let number = opened.number;
+        let payload_len = opened.payload.len();
+        packet.copy_within(PACKET_HEADER_SIZE..PACKET_HEADER_SIZE + payload_len, 0);
+        packet.truncate(payload_len);
+        Ok((kind, number, packet))
+    }
+
+    fn authenticated_prefix_len(kind: PacketKind, payload: &[u8]) -> usize {
+        PACKET_HEADER_SIZE
+            + if kind == PacketKind::Record
+                && payload.get(RecordHeader::WIRE_SIZE - 1) == Some(&(RecordType::Session as u8))
+            {
+                RecordHeader::WIRE_SIZE
+            } else {
+                payload.len()
+            }
+    }
+
+    pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Vec<u8>>> {
         let mut header = [0; FRAME_HEADER_SIZE];
         if reader.read(&mut header[..1]).await? == 0 {
             return Ok(None);
         }
         reader.read_exact(&mut header[1..]).await?;
-        let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-        if length > MAX_RECORD_SIZE + 12 {
+        let length = u32::from_be_bytes(header) as usize;
+        if length > MAX_FRAME_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "frame exceeds the transport limit",
@@ -559,68 +512,64 @@ pub mod protocol {
         }
         let mut payload = vec![0; length];
         reader.read_exact(&mut payload).await?;
-        match header[0] {
-            DATA_FRAME => Ok(Some(Frame::Record(payload))),
-            TRANSPORT_INIT_FRAME => Ok(Some(Frame::TransportInit(payload))),
-            TRANSPORT_RESPONSE_FRAME => Ok(Some(Frame::TransportResponse(payload))),
-            AUTHENTICATED_FRAME => Ok(Some(Frame::Authenticated(payload))),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported frame type",
-            )),
-        }
+        Ok(Some(payload))
     }
 
-    pub async fn send_frame(
+    pub async fn write_frame(
         writer: &mut (impl AsyncWrite + Unpin),
-        frame: &Frame,
+        payload: &[u8],
     ) -> io::Result<()> {
-        let (kind, payload) = match frame {
-            Frame::Record(payload) => (DATA_FRAME, payload),
-            Frame::TransportInit(payload) => (TRANSPORT_INIT_FRAME, payload),
-            Frame::TransportResponse(payload) => (TRANSPORT_RESPONSE_FRAME, payload),
-            Frame::Authenticated(payload) => (AUTHENTICATED_FRAME, payload),
-        };
-        if payload.len() > MAX_RECORD_SIZE + 12 {
+        if payload.len() > MAX_FRAME_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "frame exceeds the transport limit",
             ));
         }
-        let mut header = [0; FRAME_HEADER_SIZE];
-        header[0] = kind;
-        header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        let header = (payload.len() as u32).to_be_bytes();
         writer.write_all(&header).await?;
         writer.write_all(payload).await
     }
 
     #[cfg(test)]
     mod tests {
+        use ql_codec::Encode;
         use ql_wire::SessionKey;
 
-        use super::{PacketKind, ReplayWindow, open_packet, seal_packet};
+        use super::{PACKET_HEADER_SIZE, PacketKind, open_packet_owned, seal_packet};
 
         #[test]
-        fn packet_authentication_covers_header_and_payload() {
+        fn record_authentication_covers_only_routing_metadata() {
             let key = SessionKey([7; SessionKey::SIZE]);
-            let mut packet = seal_packet(&key, PacketKind::Record, 9, 4, b"record");
-            let opened = open_packet(&key, 9, &packet).unwrap();
-            assert_eq!(opened.kind, PacketKind::Record);
-            assert_eq!(opened.number, 4);
-            assert_eq!(opened.payload, b"record");
+            let mut record = ql_wire::RecordHeader::new(
+                ql_wire::RouteHeader {
+                    sender: ql_common::QID([1; ql_common::QID::SIZE]),
+                    recipient: ql_common::QID([2; ql_common::QID::SIZE]),
+                },
+                ql_wire::RecordType::Session,
+            )
+            .encode_vec();
+            record.extend_from_slice(b"encrypted body");
+            let packet = seal_packet(&key, PacketKind::Record, 9, 4, &record);
+            let (kind, number, payload) = open_packet_owned(&key, 9, packet.clone()).unwrap();
+            assert_eq!(kind, PacketKind::Record);
+            assert_eq!(number, 4);
+            assert_eq!(payload, record);
 
-            packet[17] ^= 1;
-            assert!(open_packet(&key, 9, &packet).is_err());
+            let mut changed_header = packet.clone();
+            changed_header[PACKET_HEADER_SIZE] ^= 1;
+            assert!(open_packet_owned(&key, 9, changed_header).is_err());
+
+            let mut changed_body = packet;
+            changed_body[PACKET_HEADER_SIZE + ql_wire::RecordHeader::WIRE_SIZE] ^= 1;
+            assert!(open_packet_owned(&key, 9, changed_body).is_ok());
         }
 
         #[test]
-        fn replay_window_accepts_reordering_once() {
-            let mut window = ReplayWindow::default();
-            assert!(window.accept(70));
-            assert!(window.accept(68));
-            assert!(!window.accept(68));
-            assert!(!window.accept(6));
-            assert!(window.accept(71));
+        fn control_authentication_covers_payload() {
+            let key = SessionKey([7; SessionKey::SIZE]);
+            let mut packet = seal_packet(&key, PacketKind::Attach, 9, 4, b"bundle");
+            packet[PACKET_HEADER_SIZE] ^= 1;
+            assert!(open_packet_owned(&key, 9, packet).is_err());
         }
     }
 }
