@@ -10,7 +10,7 @@ use blit::{
     layout::{Constraint, Direction, Layout, LayoutAlign},
     paint::{BorderRadius, ImageFit, ImageSampling, Rectangle, TextWrap, VerticalAlign},
     platform::Platform,
-    resource::{ImageData, ImageFormat, ImageHandle, ImagePixels, StringHandle},
+    resource::{ImageData, ImageFormat, ImageHandle, ImagePixels},
     widget::{Image, Text},
 };
 use blit_desktop::EventLoopProxy;
@@ -34,17 +34,10 @@ pub struct Page {
     scanner: MultiFormatReader,
     platform: Platform,
     preview: ImageHandle,
-    title: StringHandle,
-    subtitle: StringHandle,
-    details_label: StringHandle,
-    instruction: StringHandle,
-    camera_label: StringHandle,
-    status_label: StringHandle,
-    status: StringHandle,
 }
 
 impl Page {
-    pub fn new(mut platform: Platform, events: EventLoopProxy<Event>) -> Self {
+    pub fn new(platform: Platform, events: EventLoopProxy<Event>) -> Self {
         let mut scanner = MultiFormatReader::default();
         scanner.set_hints(&DecodeHints {
             PossibleFormats: Some(HashSet::from([BarcodeFormat::QR_CODE])),
@@ -57,15 +50,6 @@ impl Page {
             scanner,
             platform,
             preview: ImageHandle::default(),
-            title: platform.create_string("Pair Passport Prime"),
-            subtitle: platform.create_string("Secure Bluetooth pairing"),
-            details_label: platform.create_string("PAIRING"),
-            instruction: platform.create_string(
-                "Show Prime’s pairing QR code to the camera. Keep the code inside the frame.",
-            ),
-            camera_label: platform.create_string("CAMERA"),
-            status_label: platform.create_string("CONNECTION"),
-            status: platform.create_string("Looking for a pairing QR code…"),
         }
     }
 
@@ -117,7 +101,7 @@ impl Page {
             None
         };
 
-        let content = render_page(ui, &self.title, &self.subtitle);
+        let content = render_page(ui, "Pair Passport", "Secure Bluetooth pairing");
         let [details, camera] = Layout::default()
             .spacing(theme::SPACE_4)
             .constraints([Constraint::Fill(34), Constraint::Fill(66)])
@@ -136,12 +120,12 @@ impl Page {
                 Constraint::Length(status_height),
             ])
             .areas(details_content);
-        Text::new(&self.details_label)
+        Text::new("PAIRING")
             .color(theme::ACCENT)
             .text_size(theme::TEXT_LABEL)
             .text_weight(600)
             .render(ui, details_label);
-        Text::new(&self.instruction)
+        Text::new("Show Passport’s pairing QR code to the camera. Keep the code inside the frame.")
             .color(theme::TEXT_SECONDARY)
             .text_size(theme::TEXT_BODY)
             .wrap(TextWrap::Word)
@@ -158,7 +142,7 @@ impl Page {
             .spacing(theme::SPACE_2)
             .constraints([Constraint::Length(theme::SPACE_5), Constraint::Fill(1)])
             .areas(status_content);
-        Text::new(&self.status_label)
+        Text::new("CONNECTION")
             .color(theme::ACCENT)
             .text_size(theme::TEXT_LABEL)
             .text_weight(600)
@@ -179,7 +163,7 @@ impl Page {
             .background(theme::ACCENT)
             .uniform_radius(STATUS_INDICATOR_SIZE / 2.0)
             .render(ui);
-        Text::new(&self.status)
+        Text::new("Looking for a pairing QR code…")
             .color(theme::TEXT)
             .text_size(theme::TEXT_STATUS)
             .wrap(TextWrap::Word)
@@ -192,7 +176,7 @@ impl Page {
             .spacing(theme::SPACE_3)
             .constraints([Constraint::Length(theme::SPACE_5), Constraint::Fill(1)])
             .areas(camera_content);
-        Text::new(&self.camera_label)
+        Text::new("CAMERA")
             .color(theme::ACCENT)
             .text_size(theme::TEXT_LABEL)
             .text_weight(600)

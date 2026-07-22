@@ -11,15 +11,7 @@ use super::{render_button, render_card, render_page};
 use crate::theme;
 
 pub struct Page {
-    title: StringHandle,
-    subtitle: StringHandle,
-    progress_label: StringHandle,
     status: StringHandle,
-    qr_step: StringHandle,
-    bluetooth_step: StringHandle,
-    secure_step: StringHandle,
-    services_step: StringHandle,
-    start_over_label: StringHandle,
     completed: u8,
     failed: bool,
 }
@@ -27,27 +19,19 @@ pub struct Page {
 impl Page {
     pub fn new(mut platform: Platform) -> Self {
         Self {
-            title: platform.create_string("Connecting to Prime"),
-            subtitle: platform.create_string("Preparing the secure desktop relay"),
-            progress_label: platform.create_string("CONNECTION PROGRESS"),
             status: platform.create_string("QR code verified. Preparing connection…"),
-            qr_step: platform.create_string("Pairing QR code verified"),
-            bluetooth_step: platform.create_string("Bluetooth connection"),
-            secure_step: platform.create_string("Secure QLv2 session"),
-            services_step: platform.create_string("Desktop services"),
-            start_over_label: platform.create_string("Start over"),
             completed: 1,
             failed: false,
         }
     }
 
     pub fn searching(&mut self) {
-        self.status.replace("Looking for Prime over Bluetooth…");
+        self.status.replace("Looking for Passport over Bluetooth…");
     }
 
     pub fn connecting(&mut self) {
         self.status
-            .replace("Prime found. Opening Bluetooth connection…");
+            .replace("Passport found. Opening Bluetooth connection…");
     }
 
     pub fn bluetooth_connected(&mut self) {
@@ -73,8 +57,8 @@ impl Page {
             .replace("Installing router and Foundation services…");
     }
 
-    pub fn failed(&mut self, message: &str) {
-        self.status.replace(message.to_owned());
+    pub fn failed(&mut self, message: &'static str) {
+        self.status.replace(message);
         self.failed = true;
     }
 
@@ -83,7 +67,11 @@ impl Page {
     }
 
     pub fn render(&mut self, ui: &mut Ui) -> bool {
-        let content = render_page(ui, &self.title, &self.subtitle);
+        let content = render_page(
+            ui,
+            "Connecting to Passport",
+            "Preparing the secure desktop relay",
+        );
         let content_width = if content.width > 900.0 {
             content.width * 0.72
         } else {
@@ -119,7 +107,7 @@ impl Page {
                 }),
             ])
             .areas(content);
-        Text::new(&self.progress_label)
+        Text::new("CONNECTION PROGRESS")
             .color(theme::ACCENT)
             .text_size(theme::TEXT_LABEL)
             .text_weight(600)
@@ -141,10 +129,10 @@ impl Page {
             .constraints([Constraint::Fill(1); 4])
             .areas(steps);
         for (index, (label, area)) in [
-            &self.qr_step,
-            &self.bluetooth_step,
-            &self.secure_step,
-            &self.services_step,
+            "Pairing QR code verified",
+            "Bluetooth connection",
+            "Secure QLv2 session",
+            "Desktop services",
         ]
         .into_iter()
         .zip(step_areas)
@@ -164,7 +152,7 @@ impl Page {
         self.failed
             && render_button(
                 ui,
-                &self.start_over_label,
+                "Start over",
                 "start over",
                 button,
                 theme::NEGATIVE_SUBTLE,
@@ -175,7 +163,7 @@ impl Page {
 
 fn render_step(
     ui: &mut Ui,
-    label: &StringHandle,
+    label: &'static str,
     area: blit::geometry::LogicalRect,
     completed: bool,
     active: bool,

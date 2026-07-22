@@ -9,7 +9,7 @@ use blit::{
     layout::{Constraint, Direction, Layout, LayoutAlign},
     paint::{BoxShadow, HorizontalAlign, Rectangle, TextOptions, VerticalAlign},
     platform::Platform,
-    resource::StringHandle,
+    resource::TextSource,
     widget::{Button, Text},
 };
 use blit_desktop::EventLoopProxy;
@@ -92,12 +92,12 @@ impl Pages {
                 if ready && let Some(peer) = self.peer.take() {
                     self.page = Page::Paired(paired::Page::new(self.platform, peer));
                 } else if ready {
-                    self.failed("Prime connected without identity details.");
+                    self.failed("Passport connected without identity details.");
                 }
             }
-            connection::Event::Failed => self.failed("Could not connect to Prime."),
+            connection::Event::Failed => self.failed("Could not connect to Passport."),
             connection::Event::ProvisioningFailed => {
-                self.failed("Prime connected, but desktop services could not be prepared.");
+                self.failed("Passport connected, but desktop services could not be prepared.");
             }
         }
     }
@@ -131,7 +131,7 @@ impl Pages {
         action
     }
 
-    fn failed(&mut self, message: &str) {
+    fn failed(&mut self, message: &'static str) {
         match &mut self.page {
             Page::Connecting(page) => page.failed(message),
             Page::Paired(page) => page.disconnected(),
@@ -140,7 +140,7 @@ impl Pages {
     }
 }
 
-fn render_page(ui: &mut Ui, title: &StringHandle, subtitle: &StringHandle) -> LogicalRect {
+fn render_page(ui: &mut Ui, title: &'static str, subtitle: &'static str) -> LogicalRect {
     let screen = ui.screen();
     Rectangle::new(screen)
         .background(theme::BACKGROUND)
@@ -202,7 +202,7 @@ fn render_card(ui: &mut Ui, area: LogicalRect) {
 
 fn render_button(
     ui: &mut Ui,
-    label: &StringHandle,
+    label: impl Into<TextSource>,
     id: &str,
     area: LogicalRect,
     background: Color,

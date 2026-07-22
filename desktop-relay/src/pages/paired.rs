@@ -3,7 +3,7 @@ use blit::{
     layout::{Constraint, Direction, Layout},
     paint::{Rectangle, TextWrap, VerticalAlign},
     platform::Platform,
-    resource::StringHandle,
+    resource::{StringHandle, TextSource},
     widget::Text,
 };
 
@@ -11,25 +11,11 @@ use super::{render_button, render_card, render_page};
 use crate::{connection, theme};
 
 pub struct Page {
-    title: StringHandle,
-    subtitle: StringHandle,
-    status_label: StringHandle,
     status: StringHandle,
     description: StringHandle,
-    connection_label: StringHandle,
-    device_label: StringHandle,
     device: StringHandle,
-    identity_label: StringHandle,
     identity: StringHandle,
-    transport_label: StringHandle,
-    transport: StringHandle,
-    security_label: StringHandle,
-    security: StringHandle,
-    services_label: StringHandle,
-    services: StringHandle,
     unpair_label: StringHandle,
-    cancel_label: StringHandle,
-    confirm_label: StringHandle,
     connected: bool,
     confirming: bool,
     unpairing: bool,
@@ -38,26 +24,12 @@ pub struct Page {
 impl Page {
     pub fn new(mut platform: Platform, peer: connection::Peer) -> Self {
         Self {
-            title: platform.create_string("Passport Prime"),
-            subtitle: platform.create_string("Secure desktop relay"),
-            status_label: platform.create_string("STATUS"),
-            status: platform.create_string("Prime is connected"),
+            status: platform.create_string("Passport is connected"),
             description: platform
                 .create_string("The encrypted relay is ready for desktop services."),
-            connection_label: platform.create_string("CONNECTION DETAILS"),
-            device_label: platform.create_string("DEVICE"),
             device: platform.create_string(peer.name),
-            identity_label: platform.create_string("IDENTITY"),
             identity: platform.create_string(peer.qid),
-            transport_label: platform.create_string("TRANSPORT"),
-            transport: platform.create_string("Bluetooth Low Energy"),
-            security_label: platform.create_string("SECURITY"),
-            security: platform.create_string("QLv2 encrypted session"),
-            services_label: platform.create_string("SERVICES"),
-            services: platform.create_string("Router + Foundation installed"),
-            unpair_label: platform.create_string("Unpair Prime"),
-            cancel_label: platform.create_string("Cancel"),
-            confirm_label: platform.create_string("Confirm unpair"),
+            unpair_label: platform.create_string("Unpair Passport"),
             connected: true,
             confirming: false,
             unpairing: false,
@@ -65,7 +37,7 @@ impl Page {
     }
 
     pub fn disconnected(&mut self) {
-        self.status.replace("Prime is disconnected");
+        self.status.replace("Passport is disconnected");
         self.description
             .replace("The secure session ended. Pair again to reconnect.");
         self.unpair_label.replace("Unpair and pair again");
@@ -75,7 +47,7 @@ impl Page {
     pub fn unpairing(&mut self) {
         self.status.replace("Clearing the pairing…");
         self.description
-            .replace("Prime will be forgotten before pairing again.");
+            .replace("Passport will be forgotten before pairing again.");
         self.confirming = false;
         self.unpairing = true;
     }
@@ -95,7 +67,7 @@ impl Page {
         } else {
             theme::NEGATIVE_SUBTLE
         };
-        let content = render_page(ui, &self.title, &self.subtitle);
+        let content = render_page(ui, "Passport", "Secure desktop relay");
         let [summary, details] = Layout::default()
             .spacing(theme::SPACE_4)
             .constraints([Constraint::Fill(36), Constraint::Fill(64)])
@@ -115,7 +87,7 @@ impl Page {
                 Constraint::Length(theme::BUTTON_HEIGHT),
             ])
             .areas(summary_content);
-        Text::new(&self.status_label)
+        Text::new("STATUS")
             .color(status_color)
             .text_size(theme::TEXT_LABEL)
             .text_weight(600)
@@ -150,7 +122,7 @@ impl Page {
                 .areas(action);
             if render_button(
                 ui,
-                &self.cancel_label,
+                "Cancel",
                 "cancel unpair",
                 cancel,
                 theme::SURFACE_SUBTLE,
@@ -161,7 +133,7 @@ impl Page {
             }
             render_button(
                 ui,
-                &self.confirm_label,
+                "Confirm unpair",
                 "confirm unpair",
                 confirm,
                 theme::NEGATIVE_SUBTLE,
@@ -189,7 +161,7 @@ impl Page {
             .spacing(theme::SPACE_3)
             .constraints([Constraint::Length(theme::SPACE_3), Constraint::Fill(1)])
             .areas(details_content);
-        Text::new(&self.connection_label)
+        Text::new("CONNECTION DETAILS")
             .color(theme::ACCENT)
             .text_size(theme::TEXT_LABEL)
             .text_weight(600)
@@ -199,16 +171,14 @@ impl Page {
             .spacing(theme::SPACE_2)
             .constraints([Constraint::Fill(1); 5])
             .areas(rows);
-        for ((label, value), area) in [
-            (&self.device_label, &self.device),
-            (&self.identity_label, &self.identity),
-            (&self.transport_label, &self.transport),
-            (&self.security_label, &self.security),
-            (&self.services_label, &self.services),
-        ]
-        .into_iter()
-        .zip(rows)
-        {
+        let details: [(TextSource, TextSource); 5] = [
+            ("DEVICE".into(), (&self.device).into()),
+            ("IDENTITY".into(), (&self.identity).into()),
+            ("TRANSPORT".into(), "Bluetooth Low Energy".into()),
+            ("SECURITY".into(), "QLv2 encrypted session".into()),
+            ("SERVICES".into(), "Router + Foundation installed".into()),
+        ];
+        for ((label, value), area) in details.into_iter().zip(rows) {
             render_detail(ui, label, value, area);
         }
 
@@ -218,8 +188,8 @@ impl Page {
 
 fn render_detail(
     ui: &mut Ui,
-    label: &StringHandle,
-    value: &StringHandle,
+    label: impl Into<TextSource>,
+    value: impl Into<TextSource>,
     area: blit::geometry::LogicalRect,
 ) {
     let [label_area, value_area] = Layout::default()

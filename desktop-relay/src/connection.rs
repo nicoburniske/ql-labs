@@ -305,7 +305,7 @@ async fn run_connection(
                         bluetooth.peripheral.disconnect().await.ok();
                     }
                     let result: Result<Bluetooth> = async {
-                        eprintln!("searching for Prime at {}", target.address);
+                        eprintln!("searching for Passport at {}", target.address);
                         events
                             .send_event(crate::Event::Connection(Event::Searching))
                             .ok();
@@ -333,7 +333,7 @@ async fn run_connection(
                             }
                         })
                         .await
-                        .map_err(|_| anyhow!("Prime was not found within 30 seconds"));
+                        .map_err(|_| anyhow!("Passport was not found within 30 seconds"));
                         adapter
                             .stop_scan()
                             .await
@@ -348,31 +348,34 @@ async fn run_connection(
                             .await
                             .context("checking Bluetooth connection")?
                         {
-                            peripheral.connect().await.context("connecting to Prime")?;
+                            peripheral
+                                .connect()
+                                .await
+                                .context("connecting to Passport")?;
                         }
                         peripheral
                             .discover_services()
                             .await
-                            .context("discovering Prime services")?;
+                            .context("discovering Passport services")?;
                         let characteristics = peripheral.characteristics();
                         let write = characteristics
                             .iter()
                             .find(|characteristic| characteristic.uuid == WRITE_UUID)
                             .cloned()
-                            .context("Prime write characteristic unavailable")?;
+                            .context("Passport write characteristic unavailable")?;
                         let notify = characteristics
                             .iter()
                             .find(|characteristic| characteristic.uuid == NOTIFY_UUID)
                             .cloned()
-                            .context("Prime notification characteristic unavailable")?;
+                            .context("Passport notification characteristic unavailable")?;
                         peripheral
                             .subscribe(&notify)
                             .await
-                            .context("subscribing to Prime notifications")?;
+                            .context("subscribing to Passport notifications")?;
                         let notifications = peripheral
                             .notifications()
                             .await
-                            .context("opening Prime notifications")?;
+                            .context("opening Passport notifications")?;
                         Ok(Bluetooth {
                             address: target.address.clone(),
                             peripheral,
@@ -405,7 +408,7 @@ async fn run_connection(
                 bluetooth = None;
                 pairing = None;
                 handle.close_session(SessionCloseCode::CANCELLED);
-                eprintln!("Prime disconnected");
+                eprintln!("Passport disconnected");
                 events
                     .send_event(crate::Event::Connection(Event::Failed))
                     .ok();
@@ -414,7 +417,7 @@ async fn run_connection(
                 let chunk = match btp::Chunk::decode(&notification.value) {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        eprintln!("invalid Prime BTP chunk: {error}");
+                        eprintln!("invalid Passport BTP chunk: {error}");
                         continue;
                     }
                 };
@@ -425,15 +428,15 @@ async fn run_connection(
                     continue;
                 };
                 if record.len() > ql_router::MAX_RECORD_SIZE {
-                    eprintln!("Prime QL record exceeds the router limit");
+                    eprintln!("Passport QL record exceeds the router limit");
                     continue;
                 }
                 let Ok(header) = RecordHeader::decode_bytes(record.as_slice()) else {
-                    eprintln!("invalid Prime QL record header");
+                    eprintln!("invalid Passport QL record header");
                     continue;
                 };
                 if header.version != QL_WIRE_VERSION {
-                    eprintln!("unsupported Prime QL record version");
+                    eprintln!("unsupported Passport QL record version");
                     continue;
                 }
                 if header.route.recipient == relay.qid {
