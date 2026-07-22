@@ -1,7 +1,5 @@
 /target
 /.direnv
-/.foundation-server-identity.bin
-/.ql-router-identity.bin
-/foundation-server-bundle.bin
-/ql-router-bundle.bin
+identity.bin
+bundle.bin
 *.log

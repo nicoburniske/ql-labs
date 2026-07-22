@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&address).await?;
     let crypto = SoftwareCrypto;
     let identity_path = std::env::var("QL_ROUTER_IDENTITY_PATH")
-        .unwrap_or_else(|_| ".ql-router-identity.bin".into());
+        .unwrap_or_else(|_| "ql-router/identity.bin".into());
     let identity = match fs::read(&identity_path) {
         Ok(bytes) => {
             QlIdentity::decode_bytes(bytes.as_slice()).context("decoding router identity")?
@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
     fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))
         .context("securing router identity")?;
     let bundle_path =
-        std::env::var("QL_ROUTER_BUNDLE_PATH").unwrap_or_else(|_| "ql-router-bundle.bin".into());
+        std::env::var("QL_ROUTER_BUNDLE_PATH").unwrap_or_else(|_| "ql-router/bundle.bin".into());
     fs::write(&bundle_path, identity.bundle().encode_vec())
         .context("writing router peer bundle")?;
     info!(qid = %hex::encode(identity.qid.0), "QL router identity ready");

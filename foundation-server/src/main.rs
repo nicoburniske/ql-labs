@@ -28,7 +28,7 @@ struct Peer {
 async fn main() -> Result<()> {
     let crypto = SoftwareCrypto;
     let identity_path = std::env::var("QL_FOUNDATION_IDENTITY_PATH")
-        .unwrap_or_else(|_| ".foundation-server-identity.bin".into());
+        .unwrap_or_else(|_| "foundation-server/identity.bin".into());
     let identity = match fs::read(&identity_path) {
         Ok(bytes) => {
             QlIdentity::decode_bytes(bytes.as_slice()).context("decoding foundation identity")?
@@ -44,14 +44,14 @@ async fn main() -> Result<()> {
     fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))
         .context("securing foundation identity")?;
     let bundle_path = std::env::var("QL_FOUNDATION_BUNDLE_PATH")
-        .unwrap_or_else(|_| "foundation-server-bundle.bin".into());
+        .unwrap_or_else(|_| "foundation-server/bundle.bin".into());
     fs::write(&bundle_path, identity.bundle().encode_vec())
         .context("writing foundation peer bundle")?;
     eprintln!("Foundation server QID: {}", hex::encode(identity.qid.0));
     eprintln!("Foundation server peer bundle: {bundle_path}");
 
     let router_bundle_path =
-        std::env::var("QL_ROUTER_BUNDLE_PATH").unwrap_or_else(|_| "ql-router-bundle.bin".into());
+        std::env::var("QL_ROUTER_BUNDLE_PATH").unwrap_or_else(|_| "ql-router/bundle.bin".into());
     let router_bundle = fs::read(&router_bundle_path).context("reading router peer bundle")?;
     let router = PeerBundle::decode_bytes(router_bundle.as_slice())
         .context("decoding router peer bundle")?;

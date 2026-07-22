@@ -277,8 +277,8 @@ async fn run_connection(
                 states.send_modify(|state| state.phase = Phase::Provisioning);
                 tokio::task::spawn_local(async move {
                     let bundles = match (
-                        std::fs::read("ql-router-bundle.bin"),
-                        std::fs::read("foundation-server-bundle.bin"),
+                        std::fs::read("ql-router/bundle.bin"),
+                        std::fs::read("foundation-server/bundle.bin"),
                     ) {
                         (Ok(router), Ok(foundation)) => InstallPeerBundlesParams {
                             router,
