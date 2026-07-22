@@ -120,8 +120,8 @@ impl App {
                 if !page.render(ui) {
                     return;
                 }
-                page.unpairing();
                 self.connection.unpair();
+                self.page = Page::Pairing(pairing::Page::new(self.platform, self.root.project()));
                 ui.request_frame();
             }
         }
@@ -142,11 +142,7 @@ fn render_page(ui: &mut Ui, title: &'static str, subtitle: &'static str) -> Logi
         .background(theme::BACKGROUND)
         .render(ui);
     let page = theme::layout::page(screen);
-    let page_width = if page.width > 1_000.0 {
-        page.width * 0.8
-    } else {
-        page.width
-    };
+    let page_width = page.width.min(1_120.0);
     let page_height = if page.height > 640.0 {
         page.height * 0.8
     } else {

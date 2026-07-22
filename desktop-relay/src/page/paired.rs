@@ -23,7 +23,6 @@ pub struct Page {
 enum Status {
     Connected,
     Disconnected,
-    Unpairing,
 }
 
 impl Page {
@@ -40,11 +39,6 @@ impl Page {
 
     pub fn disconnected(&mut self) {
         self.status = Status::Disconnected;
-    }
-
-    pub fn unpairing(&mut self) {
-        self.status = Status::Unpairing;
-        self.confirming = false;
     }
 
     pub fn rates(&mut self, receive: u64, send: u64) {
@@ -76,14 +70,9 @@ impl Page {
                     theme::NEGATIVE,
                     theme::NEGATIVE_SUBTLE,
                 ),
-                Status::Unpairing => (
-                    "Clearing the pairing…",
-                    "Passport will be forgotten before pairing again.",
-                    theme::ACCENT,
-                    theme::ACCENT_SUBTLE,
-                ),
             };
-        let content = render_page(ui, "Passport", "Secure desktop relay");
+        let mut content = render_page(ui, "Passport", "Secure desktop relay");
+        content.height = content.height.min(400.0);
         let [summary, details] = Layout::default()
             .spacing(theme::SPACE_4)
             .constraints([Constraint::Fill(36), Constraint::Fill(64)])
@@ -129,9 +118,7 @@ impl Page {
             .wrap(TextWrap::Word)
             .render(ui, description);
 
-        let unpair = if self.status == Status::Unpairing {
-            false
-        } else if self.confirming {
+        let unpair = if self.confirming {
             let [cancel, confirm] = Layout::default()
                 .spacing(theme::SPACE_3)
                 .constraints([Constraint::Fill(1); 2])
