@@ -12,8 +12,9 @@ use crate::{connection, theme};
 
 pub struct Page {
     status: Status,
-    device: StringHandle,
-    identity: StringHandle,
+    passport_name: StringHandle,
+    passport_qid: StringHandle,
+    desktop_qid: StringHandle,
     receive_rate: StringHandle,
     send_rate: StringHandle,
     confirming: bool,
@@ -29,8 +30,9 @@ impl Page {
     pub fn new(mut platform: Platform, peer: connection::Peer) -> Self {
         Self {
             status: Status::Connected,
-            device: platform.create_string(peer.name),
-            identity: platform.create_string(peer.qid),
+            passport_name: platform.create_string(peer.name),
+            passport_qid: platform.create_string(peer.passport_qid),
+            desktop_qid: platform.create_string(peer.desktop_qid),
             receive_rate: platform.create_string("0 B/s"),
             send_rate: platform.create_string("0 B/s"),
             confirming: false,
@@ -179,11 +181,11 @@ impl Page {
             .constraints([Constraint::Fill(1); 5])
             .areas(rows);
         let details: [(TextSource, TextSource); 5] = [
-            ("DEVICE".into(), (&self.device).into()),
-            ("IDENTITY".into(), (&self.identity).into()),
+            ("PASSPORT NAME".into(), (&self.passport_name).into()),
+            ("PASSPORT QID".into(), (&self.passport_qid).into()),
+            ("DESKTOP QID".into(), (&self.desktop_qid).into()),
             ("RECEIVE".into(), (&self.receive_rate).into()),
             ("SEND".into(), (&self.send_rate).into()),
-            ("SERVICES".into(), "Router + Foundation installed".into()),
         ];
         for ((label, value), area) in details.into_iter().zip(rows) {
             render_detail(ui, label, value, area);

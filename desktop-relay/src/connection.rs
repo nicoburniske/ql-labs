@@ -47,7 +47,8 @@ pub enum Phase {
 #[derive(Clone)]
 pub struct Peer {
     pub name: String,
-    pub qid: String,
+    pub passport_qid: String,
+    pub desktop_qid: String,
 }
 
 #[derive(Clone)]
@@ -230,7 +231,8 @@ async fn run_connection(
             Step::Command(Some(Command::Peer(value))) => {
                 let display = Peer {
                     name: value.name.clone(),
-                    qid: hex::encode(value.qid.0),
+                    passport_qid: hex::encode(value.qid.0),
+                    desktop_qid: hex::encode(relay.qid.0),
                 };
                 peer = Some(value);
                 states.send_modify(|state| state.peer = Some(display));
