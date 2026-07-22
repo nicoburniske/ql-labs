@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
-use ql_router::{DEFAULT_ADDRESS, attach, connect, receive, send};
+use ql_router::{DEFAULT_ADDRESS, attach, connect_udp, receive, send};
 use ql_runtime::{RuntimeConfig, RuntimeHandle, new_runtime};
 use ql_wire::{
     PeerBundle, QlHandshakeRecord, QlIdentity, RecordHeader, RecordType, SoftwareCrypto,
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     let router = PeerBundle::decode_bytes(router_bundle.as_slice())
         .context("decoding router peer bundle")?;
     let address = std::env::var("QL_ROUTER_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.into());
-    let (mut reader, mut writer) = connect(&address).await?;
+    let (mut reader, mut writer) = connect_udp(&address, &router).await?;
 
     attach(&mut writer, &identity.bundle()).await?;
     let request = receive(&mut reader)

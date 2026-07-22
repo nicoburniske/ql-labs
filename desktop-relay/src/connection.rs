@@ -566,14 +566,27 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
         Outbound(Option<RouterMessage>),
     }
     loop {
-        let (mut reader, mut writer) = match ql_router::connect(ql_router::DEFAULT_ADDRESS).await {
-            Ok(connection) => connection,
+        let router = match std::fs::read("ql-router/bundle.bin")
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                PeerBundle::decode_bytes(bytes.as_slice()).context("decoding router peer bundle")
+            }) {
+            Ok(router) => router,
             Err(error) => {
-                tracing::warn!(%error, "QL router unavailable");
+                tracing::warn!(%error, "QL router bundle unavailable");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
+        let (mut reader, mut writer) =
+            match ql_router::connect_udp(ql_router::DEFAULT_ADDRESS, &router).await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::warn!(%error, "QL router unavailable");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
         tracing::info!("connected to QL router");
 
         'connected: loop {
