@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 blit.workspace = true
 blit-cpu.workspace = true
 blit-desktop.workspace = true

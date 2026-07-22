@@ -4,3 +4,4 @@
 /.ql-router-identity.bin
 /foundation-server-bundle.bin
 /ql-router-bundle.bin
+*.log

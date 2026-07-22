@@ -1,11 +1,11 @@
 mod connection;
-mod pages;
+mod page;
 mod platform;
 mod theme;
 
 use blit::{Ui, paint::FontId, platform::Platform};
 use blit_cpu::{Font, FontFace, RendererConfig};
-use blit_desktop::{Application, Config, EventLoopProxy, Ops};
+use blit_desktop::{Application, Config, EventLoopProxy, Root};
 
 fn main() {
     let log_level = std::env::var("QL_DESKTOP_LOG")
@@ -47,34 +47,42 @@ fn main() {
 }
 
 struct App {
-    pages: pages::Pages,
+    platform: Platform,
+    root: Root<App>,
+    connection: connection::Connection,
+    phase: connection::Phase,
+    page: page::Page,
 }
 
 impl Application for App {
     type Input = ();
 
-    fn new(platform: Platform, _events: EventLoopProxy<Self::Input>, ops: Ops<Self>) -> Self {
+    fn new(platform: Platform, _events: EventLoopProxy<Self::Input>, mut root: Root<Self>) -> Self {
         let (connection, mut state) = connection::Connection::new();
-        ops.spawn(async move {
+        root.spawn(async move |cx| {
             loop {
                 {
                     let state = state.borrow_and_update();
-                    ops.app().pages.update(&state);
+                    cx.app().update(&state);
                 }
                 if state.changed().await.is_err() {
                     break;
                 }
             }
-        })
-        .detach();
+        });
+        let page = page::Page::new(platform, &root);
         Self {
-            pages: pages::Pages::new(platform, connection),
+            platform,
+            root,
+            connection,
+            phase: connection::Phase::Unpaired,
+            page,
         }
     }
 
     fn input(&mut self, _: Self::Input) {}
 
     fn render(&mut self, ui: &mut Ui) {
-        self.pages.render(ui);
+        self.render_page(ui);
     }
 }

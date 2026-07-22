@@ -2,7 +2,7 @@ mod connecting;
 mod paired;
 mod pairing;
 
-use crate::{connection, theme};
+use crate::{App, connection, theme};
 use blit::{
     Ui,
     color::Color,
@@ -13,38 +13,39 @@ use blit::{
     resource::TextSource,
     widget::{Button, Text},
 };
-
-pub struct Pages {
-    platform: Platform,
-    connection: connection::Connection,
-    page: Page,
-    phase: connection::Phase,
-}
+use blit_desktop::{Project, Root};
 
 #[allow(clippy::large_enum_variant)]
-enum Page {
+pub enum Page {
     Pairing(pairing::Page),
     Connecting(connecting::Page),
     Paired(paired::Page),
 }
 
-impl Pages {
-    pub fn new(platform: Platform, connection: connection::Connection) -> Self {
-        Self {
-            platform,
-            connection,
-            page: Page::Pairing(pairing::Page::new(platform)),
-            phase: connection::Phase::Unpaired,
+impl Page {
+    pub fn new(platform: Platform, root: &Root<App>) -> Self {
+        Self::Pairing(pairing::Page::new(platform, root.project()))
+    }
+}
+
+impl Project<pairing::Page> for App {
+    fn project(&mut self) -> Option<&mut pairing::Page> {
+        match &mut self.page {
+            Page::Pairing(page) => Some(page),
+            _ => None,
         }
     }
+}
 
+impl App {
     pub fn update(&mut self, state: &connection::State) {
         if self.phase != state.phase {
             self.phase = state.phase;
             match state.phase {
                 connection::Phase::Unpaired => {
                     if !matches!(self.page, Page::Pairing(_)) {
-                        self.page = Page::Pairing(pairing::Page::new(self.platform));
+                        self.page =
+                            Page::Pairing(pairing::Page::new(self.platform, self.root.project()));
                     }
                 }
                 connection::Phase::Searching => {
@@ -97,7 +98,7 @@ impl Pages {
         }
     }
 
-    pub fn render(&mut self, ui: &mut Ui) {
+    pub fn render_page(&mut self, ui: &mut Ui) {
         match &mut self.page {
             Page::Pairing(page) => {
                 let Some(target) = page.render(ui) else {
@@ -112,7 +113,7 @@ impl Pages {
                     return;
                 }
                 self.connection.unpair();
-                self.page = Page::Pairing(pairing::Page::new(self.platform));
+                self.page = Page::Pairing(pairing::Page::new(self.platform, self.root.project()));
                 ui.request_frame();
             }
             Page::Paired(page) => {

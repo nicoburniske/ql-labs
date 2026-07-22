@@ -95,12 +95,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-task"
-version = "4.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
-
-[[package]]
 name = "async-trait"
 version = "0.1.91"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -176,7 +170,6 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 [[package]]
 name = "blit"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#8bfbffb367267c380d4b4ca0865c9749b5663a02"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -184,7 +177,6 @@ dependencies = [
 [[package]]
 name = "blit-cpu"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#8bfbffb367267c380d4b4ca0865c9749b5663a02"
 dependencies = [
  "blit",
  "blit-font",
@@ -195,7 +187,6 @@ dependencies = [
 [[package]]
 name = "blit-desktop"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#8bfbffb367267c380d4b4ca0865c9749b5663a02"
 dependencies = [
  "blit",
  "blit-cpu",
@@ -207,16 +198,13 @@ dependencies = [
 [[package]]
 name = "blit-executor"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#8bfbffb367267c380d4b4ca0865c9749b5663a02"
 dependencies = [
- "async-task",
- "futures-lite",
+ "slotmap",
 ]
 
 [[package]]
 name = "blit-font"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#8bfbffb367267c380d4b4ca0865c9749b5663a02"
 dependencies = [
  "blit",
  "ttf-parser",
@@ -226,7 +214,6 @@ dependencies = [
 [[package]]
 name = "blit_cache"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#8bfbffb367267c380d4b4ca0865c9749b5663a02"
 dependencies = [
  "hashbrown 0.14.5",
 ]
@@ -679,6 +666,7 @@ name = "desktop-relay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "blit",
  "blit-cpu",
  "blit-desktop",

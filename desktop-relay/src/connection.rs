@@ -181,6 +181,12 @@ async fn run_connection(
     handle: RuntimeHandle,
     states: watch::Sender<State>,
 ) {
+    enum Step {
+        Command(Option<Command>),
+        Notification(Option<ValueNotification>),
+        Sample,
+    }
+
     let manager = Manager::new().await.unwrap();
     let adapter = manager
         .adapters()
@@ -201,27 +207,27 @@ async fn run_connection(
     loop {
         let step = if let Some(bluetooth) = bluetooth.as_mut() {
             future::race(
-                async { ConnectionStep::Command(command_rx.recv().await) },
+                async { Step::Command(command_rx.recv().await) },
                 future::race(
-                    async { ConnectionStep::Notification(bluetooth.notifications.next().await) },
+                    async { Step::Notification(bluetooth.notifications.next().await) },
                     async {
                         tokio::time::sleep_until(sample_at).await;
-                        ConnectionStep::Sample
+                        Step::Sample
                     },
                 ),
             )
             .await
         } else {
-            ConnectionStep::Command(command_rx.recv().await)
+            Step::Command(command_rx.recv().await)
         };
 
         match step {
-            ConnectionStep::Command(None) => break,
-            ConnectionStep::Command(Some(Command::Unpair)) => {
+            Step::Command(None) => break,
+            Step::Command(Some(Command::Unpair)) => {
                 pairing = None;
                 handle.unpair();
             }
-            ConnectionStep::Command(Some(Command::Peer(value))) => {
+            Step::Command(Some(Command::Peer(value))) => {
                 let display = Peer {
                     name: value.name.clone(),
                     qid: hex::encode(value.qid.0),
@@ -229,7 +235,7 @@ async fn run_connection(
                 peer = Some(value);
                 states.send_modify(|state| state.peer = Some(display));
             }
-            ConnectionStep::Command(Some(Command::Status(qid, status))) => {
+            Step::Command(Some(Command::Status(qid, status))) => {
                 if status == PeerStatus::Unpaired {
                     pairing = None;
                     peer = None;
@@ -309,7 +315,7 @@ async fn run_connection(
                     }
                 });
             }
-            ConnectionStep::Command(Some(Command::Write(record, response))) => {
+            Step::Command(Some(Command::Write(record, response))) => {
                 let connected = bluetooth.is_some();
                 let mut success = connected;
                 if let Some(bluetooth) = bluetooth.as_ref() {
@@ -339,7 +345,7 @@ async fn run_connection(
                     });
                 }
             }
-            ConnectionStep::Command(Some(Command::Pair(target))) => {
+            Step::Command(Some(Command::Pair(target))) => {
                 states.send_modify(|state| {
                     state.phase = Phase::Searching;
                     state.peer = None;
@@ -455,7 +461,7 @@ async fn run_connection(
                 pairing = Some(qid);
                 handle.start_pairing(target.invite);
             }
-            ConnectionStep::Notification(None) => {
+            Step::Notification(None) => {
                 bluetooth = None;
                 pairing = None;
                 handle.close_session(SessionCloseCode::CANCELLED);
@@ -468,7 +474,7 @@ async fn run_connection(
                     state.tx_bytes_per_second = 0;
                 });
             }
-            ConnectionStep::Notification(Some(notification)) => {
+            Step::Notification(Some(notification)) => {
                 rx_since_sample += notification.value.len() as u64;
                 let chunk = match btp::Chunk::decode(&notification.value) {
                     Ok(chunk) => chunk,
@@ -528,7 +534,7 @@ async fn run_connection(
                     }
                 }
             }
-            ConnectionStep::Sample => {
+            Step::Sample => {
                 let elapsed = sample_started.elapsed().as_secs_f64();
                 let rx_bytes_per_second = (rx_since_sample as f64 / elapsed).round() as u64;
                 let tx_bytes_per_second = (tx_since_sample as f64 / elapsed).round() as u64;
@@ -553,6 +559,10 @@ async fn run_connection(
 }
 
 async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterMessage>) {
+    enum Step {
+        Record(std::io::Result<Option<Vec<u8>>>),
+        Outbound(Option<RouterMessage>),
+    }
     loop {
         let (mut reader, mut writer) = match ql_router::connect(ql_router::DEFAULT_ADDRESS).await {
             Ok(connection) => connection,
@@ -568,24 +578,23 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
             // keep the frame future alive while outbound messages are handled
             let mut record = std::pin::pin!(ql_router::receive(&mut reader));
             loop {
-                let step =
-                    future::race(async { RouterStep::Record(record.as_mut().await) }, async {
-                        RouterStep::Outbound(outbound.recv().await)
-                    })
-                    .await;
+                let step = future::race(async { Step::Record(record.as_mut().await) }, async {
+                    Step::Outbound(outbound.recv().await)
+                })
+                .await;
 
                 match step {
-                    RouterStep::Record(Ok(Some(record))) => {
+                    Step::Record(Ok(Some(record))) => {
                         connection.write(record).await;
                         break;
                     }
-                    RouterStep::Record(Ok(None)) => break 'connected,
-                    RouterStep::Record(Err(error)) => {
+                    Step::Record(Ok(None)) => break 'connected,
+                    Step::Record(Err(error)) => {
                         tracing::warn!(%error, "QL router read failed");
                         break 'connected;
                     }
-                    RouterStep::Outbound(None) => return,
-                    RouterStep::Outbound(Some(message)) => {
+                    Step::Outbound(None) => return,
+                    Step::Outbound(Some(message)) => {
                         let result = match message {
                             RouterMessage::Record(record) => {
                                 ql_router::send(&mut writer, &record).await
@@ -604,15 +613,4 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-}
-
-enum RouterStep {
-    Record(std::io::Result<Option<Vec<u8>>>),
-    Outbound(Option<RouterMessage>),
-}
-
-enum ConnectionStep {
-    Command(Option<Command>),
-    Notification(Option<ValueNotification>),
-    Sample,
 }

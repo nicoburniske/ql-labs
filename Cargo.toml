@@ -8,9 +8,9 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1"
 async-channel = "2"
-blit = { git = "https://github.com/nicoburniske/blit.git" }
-blit-cpu = { git = "https://github.com/nicoburniske/blit.git" }
-blit-desktop = { git = "https://github.com/nicoburniske/blit.git" }
+blit = { path = "../blit/core" }
+blit-cpu = { path = "../blit/cpu" }
+blit-desktop = { path = "../blit/desktop" }
 btleplug = "0.11"
 btp = { path = "../foundation-api/btp" }
 dashmap = "6"

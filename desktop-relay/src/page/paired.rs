@@ -11,49 +11,40 @@ use super::{render_button, render_card, render_page};
 use crate::{connection, theme};
 
 pub struct Page {
-    status: StringHandle,
-    description: StringHandle,
+    status: Status,
     device: StringHandle,
     identity: StringHandle,
     receive_rate: StringHandle,
     send_rate: StringHandle,
-    unpair_label: StringHandle,
-    connected: bool,
     confirming: bool,
-    unpairing: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Connected,
+    Disconnected,
+    Unpairing,
 }
 
 impl Page {
     pub fn new(mut platform: Platform, peer: connection::Peer) -> Self {
         Self {
-            status: platform.create_string("Passport is connected"),
-            description: platform
-                .create_string("The encrypted relay is ready for desktop services."),
+            status: Status::Connected,
             device: platform.create_string(peer.name),
             identity: platform.create_string(peer.qid),
             receive_rate: platform.create_string("0 B/s"),
             send_rate: platform.create_string("0 B/s"),
-            unpair_label: platform.create_string("Unpair Passport"),
-            connected: true,
             confirming: false,
-            unpairing: false,
         }
     }
 
     pub fn disconnected(&mut self) {
-        self.status.replace("Passport is disconnected");
-        self.description
-            .replace("The secure session ended. Pair again to reconnect.");
-        self.unpair_label.replace("Unpair and pair again");
-        self.connected = false;
+        self.status = Status::Disconnected;
     }
 
     pub fn unpairing(&mut self) {
-        self.status.replace("Clearing the pairing…");
-        self.description
-            .replace("Passport will be forgotten before pairing again.");
+        self.status = Status::Unpairing;
         self.confirming = false;
-        self.unpairing = true;
     }
 
     pub fn rates(&mut self, receive: u64, send: u64) {
@@ -71,20 +62,27 @@ impl Page {
     }
 
     pub fn render(&mut self, ui: &mut Ui) -> bool {
-        let status_color = if self.unpairing {
-            theme::ACCENT
-        } else if self.connected {
-            theme::POSITIVE
-        } else {
-            theme::NEGATIVE
-        };
-        let status_background = if self.unpairing {
-            theme::ACCENT_SUBTLE
-        } else if self.connected {
-            theme::POSITIVE_SUBTLE
-        } else {
-            theme::NEGATIVE_SUBTLE
-        };
+        let (status_message, description_message, status_color, status_background) =
+            match self.status {
+                Status::Connected => (
+                    "Passport is connected",
+                    "The encrypted relay is ready for desktop services.",
+                    theme::POSITIVE,
+                    theme::POSITIVE_SUBTLE,
+                ),
+                Status::Disconnected => (
+                    "Passport is disconnected",
+                    "The secure session ended. Pair again to reconnect.",
+                    theme::NEGATIVE,
+                    theme::NEGATIVE_SUBTLE,
+                ),
+                Status::Unpairing => (
+                    "Clearing the pairing…",
+                    "Passport will be forgotten before pairing again.",
+                    theme::ACCENT,
+                    theme::ACCENT_SUBTLE,
+                ),
+            };
         let content = render_page(ui, "Passport", "Secure desktop relay");
         let [summary, details] = Layout::default()
             .spacing(theme::SPACE_4)
@@ -115,7 +113,7 @@ impl Page {
             .border(theme::BORDER_WIDTH, status_color)
             .uniform_radius(theme::RADIUS_MEDIUM)
             .render(ui);
-        Text::new(&self.status)
+        Text::new(status_message)
             .color(theme::TEXT)
             .text_size(theme::TEXT_BODY)
             .text_weight(600)
@@ -125,13 +123,13 @@ impl Page {
                 ui,
                 theme::layout::padded(status, theme::SPACE_4, theme::SPACE_3),
             );
-        Text::new(&self.description)
+        Text::new(description_message)
             .color(theme::TEXT_SECONDARY)
             .text_size(theme::TEXT_STATUS)
             .wrap(TextWrap::Word)
             .render(ui, description);
 
-        let unpair = if self.unpairing {
+        let unpair = if self.status == Status::Unpairing {
             false
         } else if self.confirming {
             let [cancel, confirm] = Layout::default()
@@ -160,7 +158,11 @@ impl Page {
         } else {
             let clicked = render_button(
                 ui,
-                &self.unpair_label,
+                if self.status == Status::Disconnected {
+                    "Unpair and pair again"
+                } else {
+                    "Unpair Passport"
+                },
                 "unpair",
                 action,
                 theme::SURFACE_SUBTLE,

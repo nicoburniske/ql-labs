@@ -1,6 +1,7 @@
 #!/usr/bin/env nu
 
 cd $env.FILE_PWD
+$env.QL_DESKTOP_LOG = "debug"
 let log = ($env.FILE_PWD | path join "ql-lab.log")
 
 "" | save --force $log

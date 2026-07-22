@@ -1,10 +1,6 @@
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-    thread::JoinHandle,
-    time::Duration,
-};
+use std::{collections::HashSet, thread::JoinHandle, time::Duration};
 
+use async_channel::Receiver;
 use blit::{
     Ui,
     layout::{Constraint, Direction, Layout, LayoutAlign},
@@ -20,16 +16,19 @@ use rxing::{
 
 use super::{render_card, render_page};
 use crate::{connection, theme};
+use blit_desktop::Scope;
 
 pub struct Page {
+    _scope: Scope<Self>,
     camera: Camera,
     scanner: MultiFormatReader,
     platform: Platform,
     preview: ImageHandle,
+    frame: Option<Box<[u8]>>,
 }
 
 impl Page {
-    pub fn new(platform: Platform) -> Self {
+    pub fn new(platform: Platform, mut scope: Scope<Self>) -> Self {
         let mut scanner = MultiFormatReader::default();
         scanner.set_hints(&DecodeHints {
             PossibleFormats: Some(HashSet::from([BarcodeFormat::QR_CODE])),
@@ -37,22 +36,32 @@ impl Page {
             AlsoInverted: Some(true),
             ..Default::default()
         });
+        let (camera, frames) = start_camera();
+        scope.spawn(async move |cx| {
+            while let Ok(frame) = frames.recv().await {
+                cx.app().set_camera_frame(frame);
+            }
+        });
         Self {
-            camera: start_camera(),
+            _scope: scope,
+            camera,
             scanner,
             platform,
             preview: ImageHandle::default(),
+            frame: None,
         }
     }
 
+    fn set_camera_frame(&mut self, frame: Box<[u8]>) {
+        self.frame = Some(frame);
+    }
+
     pub fn render(&mut self, ui: &mut Ui) -> Option<connection::Target> {
-        const CAMERA_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
         const QR_SCAN_INTERVAL: Duration = Duration::from_millis(50);
         const STATUS_INDICATOR_SIZE: f32 = 8.0;
 
-        ui.timer_loop(ui.id("camera frame"), CAMERA_FRAME_INTERVAL);
         let scan = ui.timer_loop(ui.id("qr scan"), QR_SCAN_INTERVAL);
-        let luma = self.camera.state.lock().unwrap().frame.take();
+        let luma = self.frame.take();
         let target = if let Some(luma) = luma {
             let target = if scan {
                 let scan_size = self.camera.width.min(self.camera.height);
@@ -215,25 +224,18 @@ impl Page {
 }
 
 struct Camera {
-    state: Arc<Mutex<CameraState>>,
     thread: Option<JoinHandle<()>>,
     width: usize,
     height: usize,
 }
 
-struct CameraState {
-    frame: Option<Box<[u8]>>,
-    running: bool,
-}
-
 impl Drop for Camera {
     fn drop(&mut self) {
-        self.state.lock().unwrap().running = false;
         self.thread.take().unwrap().join().unwrap();
     }
 }
 
-fn start_camera() -> Camera {
+fn start_camera() -> (Camera, Receiver<Box<[u8]>>) {
     use v4l::{
         Format, FourCC,
         buffer::Type,
@@ -272,27 +274,24 @@ fn start_camera() -> Camera {
     let mut stream = MmapStream::with_buffers(&device, Type::VideoCapture, 4).unwrap();
     let width = format.width as usize;
     let height = format.height as usize;
-    let state = Arc::new(Mutex::new(CameraState {
-        frame: None,
-        running: true,
-    }));
-    let thread = std::thread::spawn({
-        let state = state.clone();
-        move || {
-            loop {
-                let (camera_frame, _) = stream.next().unwrap();
-                let mut state = state.lock().unwrap();
-                if !state.running {
-                    break;
-                }
-                state.frame = Some(camera_frame[..width * height].into());
+    let (frames, receiver) = async_channel::bounded(2);
+    let thread = std::thread::spawn(move || {
+        loop {
+            let (camera_frame, _) = stream.next().unwrap();
+            if frames
+                .force_send(camera_frame[..width * height].into())
+                .is_err()
+            {
+                break;
             }
         }
     });
-    Camera {
-        state,
-        thread: Some(thread),
-        width,
-        height,
-    }
+    (
+        Camera {
+            thread: Some(thread),
+            width,
+            height,
+        },
+        receiver,
+    )
 }
