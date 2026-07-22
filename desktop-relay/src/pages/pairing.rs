@@ -13,21 +13,13 @@ use blit::{
     resource::{ImageData, ImageFormat, ImageHandle, ImagePixels},
     widget::{Image, Text},
 };
-use blit_desktop::EventLoopProxy;
 use rxing::{
     BarcodeFormat, BinaryBitmap, DecodeHints, Luma8LuminanceSource, MultiFormatReader,
     common::HybridBinarizer,
 };
-use v4l::{
-    Format, FourCC,
-    buffer::Type,
-    io::traits::CaptureStream,
-    prelude::{Device, MmapStream},
-    video::{Capture, capture::Parameters},
-};
 
 use super::{render_card, render_page};
-use crate::{Event, connection, theme};
+use crate::{connection, theme};
 
 pub struct Page {
     camera: Camera,
@@ -37,7 +29,7 @@ pub struct Page {
 }
 
 impl Page {
-    pub fn new(platform: Platform, events: EventLoopProxy<Event>) -> Self {
+    pub fn new(platform: Platform) -> Self {
         let mut scanner = MultiFormatReader::default();
         scanner.set_hints(&DecodeHints {
             PossibleFormats: Some(HashSet::from([BarcodeFormat::QR_CODE])),
@@ -46,7 +38,7 @@ impl Page {
             ..Default::default()
         });
         Self {
-            camera: start_camera(events),
+            camera: start_camera(),
             scanner,
             platform,
             preview: ImageHandle::default(),
@@ -54,9 +46,11 @@ impl Page {
     }
 
     pub fn render(&mut self, ui: &mut Ui) -> Option<connection::Target> {
+        const CAMERA_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
         const QR_SCAN_INTERVAL: Duration = Duration::from_millis(50);
         const STATUS_INDICATOR_SIZE: f32 = 8.0;
 
+        ui.timer_loop(ui.id("camera frame"), CAMERA_FRAME_INTERVAL);
         let scan = ui.timer_loop(ui.id("qr scan"), QR_SCAN_INTERVAL);
         let luma = self.camera.state.lock().unwrap().frame.take();
         let target = if let Some(luma) = luma {
@@ -239,7 +233,15 @@ impl Drop for Camera {
     }
 }
 
-fn start_camera(events: EventLoopProxy<Event>) -> Camera {
+fn start_camera() -> Camera {
+    use v4l::{
+        Format, FourCC,
+        buffer::Type,
+        io::traits::CaptureStream,
+        prelude::{Device, MmapStream},
+        video::{Capture, capture::Parameters},
+    };
+
     const CAMERA_WIDTH: u32 = 1920;
     const CAMERA_HEIGHT: u32 = 1080;
     const CAMERA_FPS: u32 = 60;
@@ -284,9 +286,6 @@ fn start_camera(events: EventLoopProxy<Event>) -> Camera {
                     break;
                 }
                 state.frame = Some(camera_frame[..width * height].into());
-                if events.send_event(Event::CameraFrame).is_err() {
-                    break;
-                }
             }
         }
     });

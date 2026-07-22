@@ -8,6 +8,12 @@ use blit_cpu::{Font, FontFace, RendererConfig};
 use blit_desktop::{Application, Config, EventLoopProxy, Ops};
 
 fn main() {
+    let log_level = std::env::var("QL_DESKTOP_LOG")
+        .ok()
+        .and_then(|level| level.parse::<tracing::Level>().ok())
+        .unwrap_or(tracing::Level::INFO);
+    tracing_subscriber::fmt().with_max_level(log_level).init();
+
     let mut fonts = fontdb::Database::new();
     fonts.load_system_fonts();
     let id = fonts
@@ -40,38 +46,35 @@ fn main() {
     .unwrap();
 }
 
-enum Event {
-    CameraFrame,
-    Connection(connection::Event),
-}
-
 struct App {
-    connection: connection::Connection,
     pages: pages::Pages,
 }
 
 impl Application for App {
-    type Input = Event;
+    type Input = ();
 
-    fn new(platform: Platform, events: EventLoopProxy<Self::Input>, _ops: Ops<Self>) -> Self {
+    fn new(platform: Platform, _events: EventLoopProxy<Self::Input>, ops: Ops<Self>) -> Self {
+        let (connection, mut state) = connection::Connection::new();
+        ops.spawn(async move {
+            loop {
+                {
+                    let state = state.borrow_and_update();
+                    ops.app().pages.update(&state);
+                }
+                if state.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
-            connection: connection::Connection::new(events.clone()),
-            pages: pages::Pages::new(platform, events),
+            pages: pages::Pages::new(platform, connection),
         }
     }
 
-    fn input(&mut self, event: Self::Input) {
-        if let Event::Connection(event) = event {
-            self.pages.input(event);
-        }
-    }
+    fn input(&mut self, _: Self::Input) {}
 
     fn render(&mut self, ui: &mut Ui) {
-        if let Some(action) = self.pages.render(ui) {
-            match action {
-                pages::Action::Pair(target) => self.connection.pair(target),
-                pages::Action::StartOver | pages::Action::Unpair => self.connection.unpair(),
-            }
-        }
+        self.pages.render(ui);
     }
 }

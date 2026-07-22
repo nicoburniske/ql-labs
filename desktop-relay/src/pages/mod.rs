@@ -2,6 +2,7 @@ mod connecting;
 mod paired;
 mod pairing;
 
+use crate::{connection, theme};
 use blit::{
     Ui,
     color::Color,
@@ -12,22 +13,12 @@ use blit::{
     resource::TextSource,
     widget::{Button, Text},
 };
-use blit_desktop::EventLoopProxy;
-use ql_fsm::PeerStatus;
-
-use crate::{Event, connection, theme};
 
 pub struct Pages {
     platform: Platform,
-    events: EventLoopProxy<Event>,
+    connection: connection::Connection,
     page: Page,
-    peer: Option<connection::Peer>,
-}
-
-pub enum Action {
-    Pair(connection::Target),
-    StartOver,
-    Unpair,
+    phase: connection::Phase,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -38,102 +29,106 @@ enum Page {
 }
 
 impl Pages {
-    pub fn new(platform: Platform, events: EventLoopProxy<Event>) -> Self {
+    pub fn new(platform: Platform, connection: connection::Connection) -> Self {
         Self {
             platform,
-            events: events.clone(),
-            page: Page::Pairing(pairing::Page::new(platform, events)),
-            peer: None,
+            connection,
+            page: Page::Pairing(pairing::Page::new(platform)),
+            phase: connection::Phase::Unpaired,
         }
     }
 
-    pub fn input(&mut self, event: connection::Event) {
-        match event {
-            connection::Event::Searching => {
-                if let Page::Connecting(page) = &mut self.page {
-                    page.searching();
+    pub fn update(&mut self, state: &connection::State) {
+        if self.phase != state.phase {
+            self.phase = state.phase;
+            match state.phase {
+                connection::Phase::Unpaired => {
+                    if !matches!(self.page, Page::Pairing(_)) {
+                        self.page = Page::Pairing(pairing::Page::new(self.platform));
+                    }
+                }
+                connection::Phase::Searching => {
+                    if let Page::Connecting(page) = &mut self.page {
+                        page.set_status(connecting::Status::Searching);
+                    }
+                }
+                connection::Phase::Connecting => {
+                    if let Page::Connecting(page) = &mut self.page {
+                        page.set_status(connecting::Status::Connecting);
+                    }
+                }
+                connection::Phase::BluetoothConnected => {
+                    if let Page::Connecting(page) = &mut self.page {
+                        page.set_status(connecting::Status::BluetoothConnected);
+                    }
+                }
+                connection::Phase::SecureSession => {
+                    if let Page::Connecting(page) = &mut self.page {
+                        page.set_status(connecting::Status::SecureSession);
+                    }
+                }
+                connection::Phase::SecureConnected => {
+                    if let Page::Connecting(page) = &mut self.page {
+                        page.set_status(connecting::Status::SecureConnected);
+                    }
+                }
+                connection::Phase::Provisioning => {
+                    if let Page::Connecting(page) = &mut self.page {
+                        page.set_status(connecting::Status::Provisioning);
+                    }
+                }
+                connection::Phase::Ready => {
+                    let ready = matches!(&self.page, Page::Connecting(page) if page.can_finish());
+                    if ready && let Some(peer) = state.peer.clone() {
+                        self.page = Page::Paired(paired::Page::new(self.platform, peer));
+                    } else if ready {
+                        tracing::error!("Passport connected without identity details");
+                        self.failed();
+                    }
+                }
+                connection::Phase::Failed => {
+                    self.failed();
                 }
             }
-            connection::Event::Connecting => {
-                if let Page::Connecting(page) = &mut self.page {
-                    page.connecting();
-                }
-            }
-            connection::Event::BluetoothConnected => {
-                if let Page::Connecting(page) = &mut self.page {
-                    page.bluetooth_connected();
-                }
-            }
-            connection::Event::Peer(peer) => self.peer = Some(peer),
-            connection::Event::Status(PeerStatus::Initiator) => {
-                if let Page::Connecting(page) = &mut self.page {
-                    page.secure_session();
-                }
-            }
-            connection::Event::Status(PeerStatus::Connected) => {
-                if let Page::Connecting(page) = &mut self.page {
-                    page.secure_connected();
-                }
-            }
-            connection::Event::Status(PeerStatus::Disconnected) => {
-                self.failed("The secure connection was interrupted.");
-            }
-            connection::Event::Status(PeerStatus::Unpaired) => {
-                self.peer = None;
-                self.page = Page::Pairing(pairing::Page::new(self.platform, self.events.clone()));
-            }
-            connection::Event::Provisioning => {
-                if let Page::Connecting(page) = &mut self.page {
-                    page.provisioning();
-                }
-            }
-            connection::Event::Ready => {
-                let ready = matches!(&self.page, Page::Connecting(page) if page.can_finish());
-                if ready && let Some(peer) = self.peer.take() {
-                    self.page = Page::Paired(paired::Page::new(self.platform, peer));
-                } else if ready {
-                    self.failed("Passport connected without identity details.");
-                }
-            }
-            connection::Event::Failed => self.failed("Could not connect to Passport."),
-            connection::Event::ProvisioningFailed => {
-                self.failed("Passport connected, but desktop services could not be prepared.");
-            }
+        }
+
+        if let Page::Paired(page) = &mut self.page {
+            page.rates(state.rx_bytes_per_second, state.tx_bytes_per_second);
         }
     }
 
-    pub fn render(&mut self, ui: &mut Ui) -> Option<Action> {
-        let action = match &mut self.page {
-            Page::Pairing(page) => page.render(ui).map(Action::Pair),
-            Page::Connecting(page) => page.render(ui).then_some(Action::StartOver),
-            Page::Paired(page) => page.render(ui).then_some(Action::Unpair),
-        };
-        match &action {
-            Some(Action::Pair(_)) => {
-                self.page = Page::Connecting(connecting::Page::new(self.platform));
-                ui.request_frame();
-            }
-            Some(Action::StartOver) => {
-                self.peer = None;
-                self.page = Page::Pairing(pairing::Page::new(self.platform, self.events.clone()));
-                ui.request_frame();
-            }
-            Some(Action::Unpair) => {
-                if let Page::Paired(page) = &mut self.page {
-                    page.unpairing();
-                } else {
-                    unreachable!();
-                }
-                ui.request_frame();
-            }
-            None => {}
-        }
-        action
-    }
-
-    fn failed(&mut self, message: &'static str) {
+    pub fn render(&mut self, ui: &mut Ui) {
         match &mut self.page {
-            Page::Connecting(page) => page.failed(message),
+            Page::Pairing(page) => {
+                let Some(target) = page.render(ui) else {
+                    return;
+                };
+                self.connection.pair(target);
+                self.page = Page::Connecting(connecting::Page::new());
+                ui.request_frame();
+            }
+            Page::Connecting(page) => {
+                if !page.render(ui) {
+                    return;
+                }
+                self.connection.unpair();
+                self.page = Page::Pairing(pairing::Page::new(self.platform));
+                ui.request_frame();
+            }
+            Page::Paired(page) => {
+                if !page.render(ui) {
+                    return;
+                }
+                page.unpairing();
+                self.connection.unpair();
+                ui.request_frame();
+            }
+        }
+    }
+
+    fn failed(&mut self) {
+        match &mut self.page {
+            Page::Connecting(page) => page.set_status(connecting::Status::Failed),
             Page::Paired(page) => page.disconnected(),
             Page::Pairing(_) => {}
         }

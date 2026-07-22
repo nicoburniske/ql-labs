@@ -2,8 +2,6 @@ use blit::{
     Ui,
     layout::{Constraint, Direction, Layout, LayoutAlign},
     paint::{Rectangle, TextWrap, VerticalAlign},
-    platform::Platform,
-    resource::StringHandle,
     widget::Text,
 };
 
@@ -11,62 +9,56 @@ use super::{render_button, render_card, render_page};
 use crate::theme;
 
 pub struct Page {
-    status: StringHandle,
+    status: Status,
     completed: u8,
-    failed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Preparing,
+    Searching,
+    Connecting,
+    BluetoothConnected,
+    SecureSession,
+    SecureConnected,
+    Provisioning,
+    Failed,
 }
 
 impl Page {
-    pub fn new(mut platform: Platform) -> Self {
+    pub fn new() -> Self {
         Self {
-            status: platform.create_string("QR code verified. Preparing connection…"),
+            status: Status::Preparing,
             completed: 1,
-            failed: false,
         }
     }
 
-    pub fn searching(&mut self) {
-        self.status.replace("Looking for Passport over Bluetooth…");
-    }
-
-    pub fn connecting(&mut self) {
-        self.status
-            .replace("Passport found. Opening Bluetooth connection…");
-    }
-
-    pub fn bluetooth_connected(&mut self) {
-        self.completed = 2;
-        self.status
-            .replace("Bluetooth connected. Starting secure session…");
-    }
-
-    pub fn secure_session(&mut self) {
-        self.completed = 2;
-        self.status
-            .replace("Establishing the encrypted QLv2 session…");
-    }
-
-    pub fn secure_connected(&mut self) {
-        self.completed = 3;
-        self.status.replace("Secure session established.");
-    }
-
-    pub fn provisioning(&mut self) {
-        self.completed = 3;
-        self.status
-            .replace("Installing router and Foundation services…");
-    }
-
-    pub fn failed(&mut self, message: &'static str) {
-        self.status.replace(message);
-        self.failed = true;
+    pub fn set_status(&mut self, status: Status) {
+        match status {
+            Status::Preparing | Status::Searching | Status::Connecting => self.completed = 1,
+            Status::BluetoothConnected | Status::SecureSession => self.completed = 2,
+            Status::SecureConnected | Status::Provisioning => self.completed = 3,
+            Status::Failed => {}
+        }
+        self.status = status;
     }
 
     pub fn can_finish(&self) -> bool {
-        !self.failed
+        self.status != Status::Failed
     }
 
     pub fn render(&mut self, ui: &mut Ui) -> bool {
+        let failed = self.status == Status::Failed;
+        let status_message = match self.status {
+            Status::Preparing => "QR code verified. Preparing connection…",
+            Status::Searching => "Looking for Passport over Bluetooth…",
+            Status::Connecting => "Passport found. Opening Bluetooth connection…",
+            Status::BluetoothConnected => "Bluetooth connected. Starting secure session…",
+            Status::SecureSession => "Establishing the encrypted QLv2 session…",
+            Status::SecureConnected => "Secure session established.",
+            Status::Provisioning => "Installing router and Foundation services…",
+            Status::Failed => "Connection failed. Check the logs and try again.",
+        };
         let content = render_page(
             ui,
             "Connecting to Passport",
@@ -78,7 +70,7 @@ impl Page {
             content.width
         };
         let content_height = if content.height > 500.0 {
-            content.height * if self.failed { 0.7 } else { 0.62 }
+            content.height * if failed { 0.7 } else { 0.62 }
         } else {
             content.height
         };
@@ -100,11 +92,7 @@ impl Page {
                 Constraint::Length(theme::SPACE_3),
                 Constraint::Length(40.0),
                 Constraint::Fill(1),
-                Constraint::Length(if self.failed {
-                    theme::BUTTON_HEIGHT
-                } else {
-                    0.0
-                }),
+                Constraint::Length(if failed { theme::BUTTON_HEIGHT } else { 0.0 }),
             ])
             .areas(content);
         Text::new("CONNECTION PROGRESS")
@@ -112,12 +100,8 @@ impl Page {
             .text_size(theme::TEXT_LABEL)
             .text_weight(600)
             .render(ui, label);
-        Text::new(&self.status)
-            .color(if self.failed {
-                theme::NEGATIVE
-            } else {
-                theme::TEXT
-            })
+        Text::new(status_message)
+            .color(if failed { theme::NEGATIVE } else { theme::TEXT })
             .text_size(theme::TEXT_BODY)
             .wrap(TextWrap::Word)
             .vertical_align(VerticalAlign::Center)
@@ -145,11 +129,11 @@ impl Page {
                 area,
                 index <= self.completed,
                 index == self.completed + 1,
-                self.failed,
+                failed,
             );
         }
 
-        self.failed
+        failed
             && render_button(
                 ui,
                 "Start over",

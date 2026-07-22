@@ -18,11 +18,12 @@ use ql_wire::{
     PeerBundle, QL_WIRE_VERSION, RecordHeader, RecordType, SessionCloseCode, SoftwareCrypto,
     generate_identity,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot, watch},
+    time::Instant,
+};
 use url::Url;
 use uuid::Uuid;
-
-use blit_desktop::EventLoopProxy;
 
 use crate::platform::Platform;
 
@@ -30,16 +31,17 @@ const NUS_UUID: Uuid = Uuid::from_u128(0x6E400001_B5A3_F393_E0A9_E50E24DCCA9E);
 const WRITE_UUID: Uuid = Uuid::from_u128(0x6E400002_B5A3_F393_E0A9_E50E24DCCA9E);
 const NOTIFY_UUID: Uuid = Uuid::from_u128(0x6E400003_B5A3_F393_E0A9_E50E24DCCA9E);
 
-pub enum Event {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Unpaired,
     Searching,
     Connecting,
     BluetoothConnected,
-    Peer(Peer),
-    Status(PeerStatus),
+    SecureSession,
+    SecureConnected,
     Provisioning,
     Ready,
     Failed,
-    ProvisioningFailed,
 }
 
 #[derive(Clone)]
@@ -49,12 +51,26 @@ pub struct Peer {
 }
 
 #[derive(Clone)]
+pub struct State {
+    pub phase: Phase,
+    pub peer: Option<Peer>,
+    pub rx_bytes_per_second: u64,
+    pub tx_bytes_per_second: u64,
+}
+
+#[derive(Clone)]
 pub struct Connection(mpsc::Sender<Command>);
 
 impl Connection {
-    pub fn new(events: EventLoopProxy<crate::Event>) -> Self {
+    pub fn new() -> (Self, watch::Receiver<State>) {
         let (commands, command_rx) = mpsc::channel(64);
         let connection = Self(commands);
+        let (states, state) = watch::channel(State {
+            phase: Phase::Unpaired,
+            peer: None,
+            rx_bytes_per_second: 0,
+            tx_bytes_per_second: 0,
+        });
         std::thread::spawn({
             let connection = connection.clone();
             move || {
@@ -67,7 +83,6 @@ impl Connection {
                 let platform = Platform {
                     connection: connection.clone(),
                     inbound: Some(inbound_rx),
-                    events: events.clone(),
                 };
                 let identity = generate_identity(&SoftwareCrypto, "QL Lab Desktop");
                 let relay = Relay {
@@ -80,11 +95,11 @@ impl Connection {
                 let local = tokio::task::LocalSet::new();
                 local.spawn_local(ql.run());
                 runtime.block_on(local.run_until(run_connection(
-                    connection, command_rx, router_rx, relay, handle, events,
+                    connection, command_rx, router_rx, relay, handle, states,
                 )));
             }
         });
-        connection
+        (connection, state)
     }
 
     pub fn pair(&self, target: Target) {
@@ -164,7 +179,7 @@ async fn run_connection(
     router_rx: mpsc::Receiver<RouterMessage>,
     relay: Relay,
     handle: RuntimeHandle,
-    events: EventLoopProxy<crate::Event>,
+    states: watch::Sender<State>,
 ) {
     let manager = Manager::new().await.unwrap();
     let adapter = manager
@@ -179,11 +194,21 @@ async fn run_connection(
     let mut bluetooth: Option<Bluetooth> = None;
     let mut peer = None;
     let mut pairing = None;
+    let mut rx_since_sample = 0_u64;
+    let mut tx_since_sample = 0_u64;
+    let mut sample_started = Instant::now();
+    let mut sample_at = sample_started + Duration::from_secs(1);
     loop {
         let step = if let Some(bluetooth) = bluetooth.as_mut() {
             future::race(
                 async { ConnectionStep::Command(command_rx.recv().await) },
-                async { ConnectionStep::Notification(bluetooth.notifications.next().await) },
+                future::race(
+                    async { ConnectionStep::Notification(bluetooth.notifications.next().await) },
+                    async {
+                        tokio::time::sleep_until(sample_at).await;
+                        ConnectionStep::Sample
+                    },
+                ),
             )
             .await
         } else {
@@ -196,27 +221,54 @@ async fn run_connection(
                 pairing = None;
                 handle.unpair();
             }
-            ConnectionStep::Command(Some(Command::Peer(value))) => peer = Some(value),
+            ConnectionStep::Command(Some(Command::Peer(value))) => {
+                let display = Peer {
+                    name: value.name.clone(),
+                    qid: hex::encode(value.qid.0),
+                };
+                peer = Some(value);
+                states.send_modify(|state| state.peer = Some(display));
+            }
             ConnectionStep::Command(Some(Command::Status(qid, status))) => {
                 if status == PeerStatus::Unpaired {
                     pairing = None;
                     peer = None;
+                    rx_since_sample = 0;
+                    tx_since_sample = 0;
+                    states.send_modify(|state| {
+                        state.phase = Phase::Unpaired;
+                        state.peer = None;
+                        state.rx_bytes_per_second = 0;
+                        state.tx_bytes_per_second = 0;
+                    });
+                    continue;
+                }
+                if status == PeerStatus::Disconnected {
+                    states.send_modify(|state| {
+                        state.phase = Phase::Failed;
+                        state.rx_bytes_per_second = 0;
+                        state.tx_bytes_per_second = 0;
+                    });
+                    continue;
+                }
+                if status == PeerStatus::Initiator {
+                    states.send_modify(|state| state.phase = Phase::SecureSession);
                     continue;
                 }
                 if status != PeerStatus::Connected || qid != pairing {
                     continue;
                 }
+                states.send_modify(|state| state.phase = Phase::SecureConnected);
                 pairing = None;
                 let Some(peer) = peer.clone() else {
-                    eprintln!("paired peer bundle unavailable");
+                    tracing::error!("paired peer bundle unavailable");
+                    states.send_modify(|state| state.phase = Phase::Failed);
                     continue;
                 };
                 let router = relay.router.clone();
                 let handle = handle.clone();
-                let events = events.clone();
-                events
-                    .send_event(crate::Event::Connection(Event::Provisioning))
-                    .ok();
+                let states = states.clone();
+                states.send_modify(|state| state.phase = Phase::Provisioning);
                 tokio::task::spawn_local(async move {
                     let bundles = match (
                         std::fs::read("ql-router-bundle.bin"),
@@ -227,10 +279,8 @@ async fn run_connection(
                             peers: vec![foundation],
                         },
                         (Err(error), _) | (_, Err(error)) => {
-                            eprintln!("reading peer bundles failed: {error}");
-                            events
-                                .send_event(crate::Event::Connection(Event::ProvisioningFailed))
-                                .ok();
+                            tracing::error!(%error, "reading peer bundles failed");
+                            states.send_modify(|state| state.phase = Phase::Failed);
                             return;
                         }
                     };
@@ -240,29 +290,21 @@ async fn run_connection(
                         .await
                     {
                         Ok(InstallPeerBundlesResponse::Installed) => {
-                            eprintln!("installed router and Foundation peer bundles");
+                            tracing::info!("installed router and Foundation peer bundles");
                             if router.send(RouterMessage::Attach(peer)).await.is_err() {
-                                eprintln!("QL router stopped before peer attachment");
-                                events
-                                    .send_event(crate::Event::Connection(Event::ProvisioningFailed))
-                                    .ok();
+                                tracing::error!("QL router stopped before peer attachment");
+                                states.send_modify(|state| state.phase = Phase::Failed);
                             } else {
-                                events
-                                    .send_event(crate::Event::Connection(Event::Ready))
-                                    .ok();
+                                states.send_modify(|state| state.phase = Phase::Ready);
                             }
                         }
                         Ok(InstallPeerBundlesResponse::Rejected) => {
-                            eprintln!("Passport rejected peer bundles");
-                            events
-                                .send_event(crate::Event::Connection(Event::ProvisioningFailed))
-                                .ok();
+                            tracing::error!("Passport rejected peer bundles");
+                            states.send_modify(|state| state.phase = Phase::Failed);
                         }
                         Err(error) => {
-                            eprintln!("installing peer bundles failed: {error}");
-                            events
-                                .send_event(crate::Event::Connection(Event::ProvisioningFailed))
-                                .ok();
+                            tracing::error!(%error, "installing peer bundles failed");
+                            states.send_modify(|state| state.phase = Phase::Failed);
                         }
                     }
                 });
@@ -272,24 +314,38 @@ async fn run_connection(
                 let mut success = connected;
                 if let Some(bluetooth) = bluetooth.as_ref() {
                     for chunk in btp::chunk(&record) {
-                        if bluetooth
+                        if let Err(error) = bluetooth
                             .peripheral
                             .write(&bluetooth.write, &chunk, WriteType::WithoutResponse)
                             .await
-                            .is_err()
                         {
+                            tracing::error!(%error, "writing Passport BTP chunk failed");
                             success = false;
                             break;
                         }
+                        tx_since_sample += chunk.len() as u64;
                     }
                 }
                 response.send(success).ok();
                 if connected && !success {
                     bluetooth = None;
                     handle.close_session(SessionCloseCode::CANCELLED);
+                    rx_since_sample = 0;
+                    tx_since_sample = 0;
+                    states.send_modify(|state| {
+                        state.phase = Phase::Failed;
+                        state.rx_bytes_per_second = 0;
+                        state.tx_bytes_per_second = 0;
+                    });
                 }
             }
             ConnectionStep::Command(Some(Command::Pair(target))) => {
+                states.send_modify(|state| {
+                    state.phase = Phase::Searching;
+                    state.peer = None;
+                    state.rx_bytes_per_second = 0;
+                    state.tx_bytes_per_second = 0;
+                });
                 let reusable = if let Some(bluetooth) = bluetooth.as_ref() {
                     bluetooth.address.eq_ignore_ascii_case(&target.address)
                         && bluetooth.peripheral.is_connected().await.unwrap_or(false)
@@ -299,16 +355,13 @@ async fn run_connection(
                 handle.close_session(SessionCloseCode::CANCELLED);
 
                 if reusable {
-                    eprintln!("reusing active Bluetooth connection");
+                    tracing::info!("reusing active Bluetooth connection");
                 } else {
                     if let Some(bluetooth) = bluetooth.take() {
                         bluetooth.peripheral.disconnect().await.ok();
                     }
                     let result: Result<Bluetooth> = async {
-                        eprintln!("searching for Passport at {}", target.address);
-                        events
-                            .send_event(crate::Event::Connection(Event::Searching))
-                            .ok();
+                        tracing::info!(address = %target.address, "searching for Passport");
                         adapter
                             .start_scan(ScanFilter {
                                 services: vec![NUS_UUID],
@@ -340,9 +393,7 @@ async fn run_connection(
                             .context("stopping Bluetooth scan")?;
                         let peripheral = peripheral??;
 
-                        events
-                            .send_event(crate::Event::Connection(Event::Connecting))
-                            .ok();
+                        states.send_modify(|state| state.phase = Phase::Connecting);
                         if !peripheral
                             .is_connected()
                             .await
@@ -388,18 +439,18 @@ async fn run_connection(
                     match result {
                         Ok(connection) => bluetooth = Some(connection),
                         Err(error) => {
-                            eprintln!("Bluetooth session failed: {error:#}");
-                            events
-                                .send_event(crate::Event::Connection(Event::Failed))
-                                .ok();
+                            tracing::error!(error = ?error, "Bluetooth session failed");
+                            states.send_modify(|state| state.phase = Phase::Failed);
                             continue;
                         }
                     }
                 }
 
-                events
-                    .send_event(crate::Event::Connection(Event::BluetoothConnected))
-                    .ok();
+                rx_since_sample = 0;
+                tx_since_sample = 0;
+                sample_started = Instant::now();
+                sample_at = sample_started + Duration::from_secs(1);
+                states.send_modify(|state| state.phase = Phase::BluetoothConnected);
                 let qid = target.invite.qid;
                 pairing = Some(qid);
                 handle.start_pairing(target.invite);
@@ -408,16 +459,21 @@ async fn run_connection(
                 bluetooth = None;
                 pairing = None;
                 handle.close_session(SessionCloseCode::CANCELLED);
-                eprintln!("Passport disconnected");
-                events
-                    .send_event(crate::Event::Connection(Event::Failed))
-                    .ok();
+                tracing::warn!("Passport disconnected");
+                rx_since_sample = 0;
+                tx_since_sample = 0;
+                states.send_modify(|state| {
+                    state.phase = Phase::Failed;
+                    state.rx_bytes_per_second = 0;
+                    state.tx_bytes_per_second = 0;
+                });
             }
             ConnectionStep::Notification(Some(notification)) => {
+                rx_since_sample += notification.value.len() as u64;
                 let chunk = match btp::Chunk::decode(&notification.value) {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        eprintln!("invalid Passport BTP chunk: {error}");
+                        tracing::warn!(%error, "invalid Passport BTP chunk");
                         continue;
                     }
                 };
@@ -428,22 +484,28 @@ async fn run_connection(
                     continue;
                 };
                 if record.len() > ql_router::MAX_RECORD_SIZE {
-                    eprintln!("Passport QL record exceeds the router limit");
+                    tracing::warn!(
+                        bytes = record.len(),
+                        "Passport QL record exceeds router limit"
+                    );
                     continue;
                 }
                 let Ok(header) = RecordHeader::decode_bytes(record.as_slice()) else {
-                    eprintln!("invalid Passport QL record header");
+                    tracing::warn!("invalid Passport QL record header");
                     continue;
                 };
                 if header.version != QL_WIRE_VERSION {
-                    eprintln!("unsupported Passport QL record version");
+                    tracing::warn!(
+                        version = header.version,
+                        "unsupported Passport QL record version"
+                    );
                     continue;
                 }
                 if header.route.recipient == relay.qid {
                     if header.record_type == RecordType::Handshake {
-                        eprintln!(
-                            "delivering handshake sender={} to desktop runtime",
-                            hex::encode(header.route.sender.0)
+                        tracing::debug!(
+                            sender = %hex::encode(header.route.sender.0),
+                            "delivering handshake to desktop runtime"
                         );
                     }
                     if relay.runtime.send(record).await.is_err() {
@@ -451,10 +513,10 @@ async fn run_connection(
                     }
                 } else {
                     if header.record_type == RecordType::Handshake {
-                        eprintln!(
-                            "forwarding handshake sender={} recipient={} to router",
-                            hex::encode(header.route.sender.0),
-                            hex::encode(header.route.recipient.0)
+                        tracing::debug!(
+                            sender = %hex::encode(header.route.sender.0),
+                            recipient = %hex::encode(header.route.recipient.0),
+                            "forwarding handshake to router"
                         );
                     }
                     if relay
@@ -462,9 +524,29 @@ async fn run_connection(
                         .try_send(RouterMessage::Record(record))
                         .is_err()
                     {
-                        eprintln!("QL router queue unavailable; dropping record");
+                        tracing::warn!("QL router queue unavailable; dropping record");
                     }
                 }
+            }
+            ConnectionStep::Sample => {
+                let elapsed = sample_started.elapsed().as_secs_f64();
+                let rx_bytes_per_second = (rx_since_sample as f64 / elapsed).round() as u64;
+                let tx_bytes_per_second = (tx_since_sample as f64 / elapsed).round() as u64;
+                rx_since_sample = 0;
+                tx_since_sample = 0;
+                sample_started = Instant::now();
+                sample_at = sample_started + Duration::from_secs(1);
+                states.send_if_modified(|state| {
+                    if state.rx_bytes_per_second == rx_bytes_per_second
+                        && state.tx_bytes_per_second == tx_bytes_per_second
+                    {
+                        false
+                    } else {
+                        state.rx_bytes_per_second = rx_bytes_per_second;
+                        state.tx_bytes_per_second = tx_bytes_per_second;
+                        true
+                    }
+                });
             }
         }
     }
@@ -475,12 +557,12 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
         let (mut reader, mut writer) = match ql_router::connect(ql_router::DEFAULT_ADDRESS).await {
             Ok(connection) => connection,
             Err(error) => {
-                eprintln!("QL router unavailable: {error}");
+                tracing::warn!(%error, "QL router unavailable");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
-        eprintln!("connected to QL router");
+        tracing::info!("connected to QL router");
 
         'connected: loop {
             // keep the frame future alive while outbound messages are handled
@@ -499,7 +581,7 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
                     }
                     RouterStep::Record(Ok(None)) => break 'connected,
                     RouterStep::Record(Err(error)) => {
-                        eprintln!("QL router read failed: {error}");
+                        tracing::warn!(%error, "QL router read failed");
                         break 'connected;
                     }
                     RouterStep::Outbound(None) => return,
@@ -513,7 +595,7 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
                             }
                         };
                         if let Err(error) = result {
-                            eprintln!("QL router write failed: {error}");
+                            tracing::warn!(%error, "QL router write failed");
                             break 'connected;
                         }
                     }
@@ -532,4 +614,5 @@ enum RouterStep {
 enum ConnectionStep {
     Command(Option<Command>),
     Notification(Option<ValueNotification>),
+    Sample,
 }

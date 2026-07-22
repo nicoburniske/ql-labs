@@ -5,7 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blit_desktop::EventLoopProxy;
 use ql_common::{QID, StreamInfo};
 use ql_fsm::{PeerStatus, ReceiveError};
 use ql_runtime::{
@@ -15,12 +14,11 @@ use ql_runtime::{
 use ql_wire::{PeerBundle, SoftwareCrypto};
 use tokio::{sync::mpsc, time::Sleep};
 
-use crate::connection::{Connection, Event};
+use crate::connection::Connection;
 
 pub struct Platform {
     pub connection: Connection,
     pub inbound: Option<mpsc::Receiver<Vec<u8>>>,
-    pub events: EventLoopProxy<crate::Event>,
 }
 
 impl QlPlatform for Platform {
@@ -53,39 +51,29 @@ impl QlPlatform for Platform {
     }
 
     fn persist_peer(&self, peer: PeerBundle) {
-        eprintln!("paired QID {} ({})", hex::encode(peer.qid.0), peer.name);
-        self.events
-            .send_event(crate::Event::Connection(Event::Peer(
-                crate::connection::Peer {
-                    qid: hex::encode(peer.qid.0),
-                    name: peer.name.clone(),
-                },
-            )))
-            .ok();
+        tracing::info!(qid = %hex::encode(peer.qid.0), name = %peer.name, "paired Passport");
         self.connection.peer(peer);
     }
 
     fn handle_peer_status(&self, peer: Option<QID>, status: PeerStatus) {
-        eprintln!(
-            "QLv2 peer status: peer={:?} status={status:?}",
-            peer.map(|qid| hex::encode(qid.0))
+        tracing::info!(
+            peer = ?peer.map(|qid| hex::encode(qid.0)),
+            ?status,
+            "QLv2 peer status changed"
         );
         self.connection.status(peer, status);
-        self.events
-            .send_event(crate::Event::Connection(Event::Status(status)))
-            .ok();
     }
 
     fn handle_inbound(&self, info: StreamInfo, _: QlStream) {
-        eprintln!(
-            "ignoring inbound QL stream from {} with {} header bytes",
-            hex::encode(info.qid.0),
-            info.header.len()
+        tracing::warn!(
+            qid = %hex::encode(info.qid.0),
+            header_bytes = info.header.len(),
+            "ignoring inbound QL stream"
         );
     }
 
     fn handle_recv_error(&self, error: ReceiveError) {
-        eprintln!("rejected QL record: {error:?}");
+        tracing::warn!(?error, "rejected QL record");
     }
 }
 

@@ -696,6 +696,8 @@ dependencies = [
  "ql-wire",
  "rxing",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "v4l",

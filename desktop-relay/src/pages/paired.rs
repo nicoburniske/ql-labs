@@ -15,6 +15,8 @@ pub struct Page {
     description: StringHandle,
     device: StringHandle,
     identity: StringHandle,
+    receive_rate: StringHandle,
+    send_rate: StringHandle,
     unpair_label: StringHandle,
     connected: bool,
     confirming: bool,
@@ -29,6 +31,8 @@ impl Page {
                 .create_string("The encrypted relay is ready for desktop services."),
             device: platform.create_string(peer.name),
             identity: platform.create_string(peer.qid),
+            receive_rate: platform.create_string("0 B/s"),
+            send_rate: platform.create_string("0 B/s"),
             unpair_label: platform.create_string("Unpair Passport"),
             connected: true,
             confirming: false,
@@ -50,6 +54,20 @@ impl Page {
             .replace("Passport will be forgotten before pairing again.");
         self.confirming = false;
         self.unpairing = true;
+    }
+
+    pub fn rates(&mut self, receive: u64, send: u64) {
+        let format = |bytes_per_second| {
+            if bytes_per_second < 1_000 {
+                format!("{bytes_per_second} B/s")
+            } else if bytes_per_second < 1_000_000 {
+                format!("{:.1} KB/s", bytes_per_second as f64 / 1_000.0)
+            } else {
+                format!("{:.1} MB/s", bytes_per_second as f64 / 1_000_000.0)
+            }
+        };
+        self.receive_rate.replace(format(receive));
+        self.send_rate.replace(format(send));
     }
 
     pub fn render(&mut self, ui: &mut Ui) -> bool {
@@ -174,8 +192,8 @@ impl Page {
         let details: [(TextSource, TextSource); 5] = [
             ("DEVICE".into(), (&self.device).into()),
             ("IDENTITY".into(), (&self.identity).into()),
-            ("TRANSPORT".into(), "Bluetooth Low Energy".into()),
-            ("SECURITY".into(), "QLv2 encrypted session".into()),
+            ("RECEIVE".into(), (&self.receive_rate).into()),
+            ("SEND".into(), (&self.send_rate).into()),
             ("SERVICES".into(), "Router + Foundation installed".into()),
         ];
         for ((label, value), area) in details.into_iter().zip(rows) {
