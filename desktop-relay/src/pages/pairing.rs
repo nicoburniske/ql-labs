@@ -7,18 +7,13 @@ use std::{
 
 use blit::{
     Ui,
-    color::Color,
     layout::{Constraint, Direction, Layout, LayoutAlign},
-    paint::{
-        BorderRadius, BoxShadow, HorizontalAlign, ImageFit, ImageSampling, Rectangle, TextOptions,
-        TextWrap, VerticalAlign,
-    },
+    paint::{BorderRadius, ImageFit, ImageSampling, Rectangle, TextWrap, VerticalAlign},
     platform::Platform,
     resource::{ImageData, ImageFormat, ImageHandle, ImagePixels, StringHandle},
-    widget::{Button, Image, Text},
+    widget::{Image, Text},
 };
 use blit_desktop::EventLoopProxy;
-use ql_fsm::PeerStatus;
 use rxing::{
     BarcodeFormat, BinaryBitmap, DecodeHints, Luma8LuminanceSource, MultiFormatReader,
     common::HybridBinarizer,
@@ -31,6 +26,7 @@ use v4l::{
     video::{Capture, capture::Parameters},
 };
 
+use super::{render_card, render_page};
 use crate::{Event, connection, theme};
 
 pub struct Page {
@@ -38,9 +34,6 @@ pub struct Page {
     scanner: MultiFormatReader,
     platform: Platform,
     preview: ImageHandle,
-    scanning: bool,
-    status_color: Color,
-    status_background: Color,
     title: StringHandle,
     subtitle: StringHandle,
     details_label: StringHandle,
@@ -48,12 +41,6 @@ pub struct Page {
     camera_label: StringHandle,
     status_label: StringHandle,
     status: StringHandle,
-    reset_label: StringHandle,
-}
-
-pub enum Action {
-    Pair(connection::Target),
-    Reset,
 }
 
 impl Page {
@@ -70,9 +57,6 @@ impl Page {
             scanner,
             platform,
             preview: ImageHandle::default(),
-            scanning: true,
-            status_color: theme::ACCENT,
-            status_background: theme::ACCENT_SUBTLE,
             title: platform.create_string("Pair Passport Prime"),
             subtitle: platform.create_string("Secure Bluetooth pairing"),
             details_label: platform.create_string("PAIRING"),
@@ -82,58 +66,26 @@ impl Page {
             camera_label: platform.create_string("CAMERA"),
             status_label: platform.create_string("CONNECTION"),
             status: platform.create_string("Looking for a pairing QR code…"),
-            reset_label: platform.create_string("Restart pairing"),
         }
     }
 
-    pub fn input(&mut self, event: connection::Event) {
-        match event {
-            connection::Event::Searching => {
-                self.status_color = theme::ACCENT;
-                self.status_background = theme::ACCENT_SUBTLE;
-                self.status.replace("Searching for Prime…");
-            }
-            connection::Event::Connecting => {
-                self.status_color = theme::ACCENT;
-                self.status_background = theme::ACCENT_SUBTLE;
-                self.status.replace("Connecting over Bluetooth…");
-            }
-            connection::Event::Peer(PeerStatus::Initiator) => {
-                self.status_color = theme::ACCENT;
-                self.status_background = theme::ACCENT_SUBTLE;
-                self.status.replace("Establishing a secure QLv2 session…")
-            }
-            connection::Event::Peer(PeerStatus::Connected) => {
-                self.status_color = theme::POSITIVE;
-                self.status_background = theme::POSITIVE_SUBTLE;
-                self.status.replace("Prime is securely paired.");
-            }
-            connection::Event::Peer(PeerStatus::Disconnected | PeerStatus::Unpaired)
-            | connection::Event::Failed => {
-                self.scanning = true;
-                self.status_color = theme::NEGATIVE;
-                self.status_background = theme::NEGATIVE_SUBTLE;
-                self.status
-                    .replace("Pairing failed. Show the QR code to try again.");
-            }
-        }
-    }
-
-    pub fn render(&mut self, ui: &mut Ui) -> Option<Action> {
+    pub fn render(&mut self, ui: &mut Ui) -> Option<connection::Target> {
         const QR_SCAN_INTERVAL: Duration = Duration::from_millis(50);
         const STATUS_INDICATOR_SIZE: f32 = 8.0;
-        const STATUS_HEIGHT: f32 = 108.0;
 
-        // camera frame
-
-        let scan = self.scanning && ui.timer_loop(ui.id("qr scan"), QR_SCAN_INTERVAL);
+        let scan = ui.timer_loop(ui.id("qr scan"), QR_SCAN_INTERVAL);
         let luma = self.camera.state.lock().unwrap().frame.take();
         let target = if let Some(luma) = luma {
             let target = if scan {
                 let scan_size = self.camera.width.min(self.camera.height);
                 let scan_left = (self.camera.width - scan_size) / 2;
+                let scan_top = (self.camera.height - scan_size) / 2;
                 let mut scan_frame = Vec::with_capacity(scan_size * scan_size);
-                for row in luma.chunks_exact(self.camera.width) {
+                for row in luma
+                    .chunks_exact(self.camera.width)
+                    .skip(scan_top)
+                    .take(scan_size)
+                {
                     scan_frame.extend_from_slice(&row[scan_left..scan_left + scan_size]);
                 }
                 let mut bitmap = BinaryBitmap::new(HybridBinarizer::new(
@@ -164,92 +116,40 @@ impl Page {
         } else {
             None
         };
-        if target.is_some() {
-            self.scanning = false;
-            self.status_color = theme::ACCENT;
-            self.status_background = theme::ACCENT_SUBTLE;
-            self.status.replace("QR code found. Connecting to Prime…");
-        }
 
-        // page layout
-
-        let screen = ui.screen();
-        Rectangle::new(screen)
-            .background(theme::BACKGROUND)
-            .render(ui);
-
-        let page = theme::layout::page(screen);
-        let [header, content] = Layout::default()
-            .direction(Direction::Vertical)
-            .spacing(theme::SPACE_5)
-            .constraints([Constraint::Length(theme::TITLE_HEIGHT), Constraint::Fill(1)])
-            .areas(page);
-        let [title, subtitle] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(theme::SPACE_5)])
-            .areas(header);
-
-        Text::new(&self.title)
-            .color(theme::TEXT)
-            .text_size(theme::TEXT_TITLE)
-            .text_weight(600)
-            .render(ui, title);
-        Text::new(&self.subtitle)
-            .color(theme::TEXT_MUTED)
-            .text_size(theme::TEXT_STATUS)
-            .vertical_align(VerticalAlign::Bottom)
-            .render(ui, subtitle);
-
-        // cards
-
+        let content = render_page(ui, &self.title, &self.subtitle);
         let [details, camera] = Layout::default()
-            .spacing(theme::SPACE_6)
-            .constraints([Constraint::Fill(38), Constraint::Fill(62)])
-            .areas(content);
-        for card in [details, camera] {
-            BoxShadow::new(card, theme::SHADOW)
-                .uniform_radius(theme::RADIUS_LARGE)
-                .offset(0.0, theme::SHADOW_OFFSET)
-                .blur(theme::SHADOW_BLUR)
-                .render(ui);
-            Rectangle::new(card)
-                .background(theme::SURFACE)
-                .border(theme::BORDER_WIDTH, theme::BORDER)
-                .uniform_radius(theme::RADIUS_LARGE)
-                .render(ui);
-        }
-
-        // pairing instructions
-
-        let details_content = theme::layout::padded(details, theme::SPACE_6, theme::SPACE_5);
-        let [details_label, instruction, status, reset] = Layout::default()
-            .direction(Direction::Vertical)
             .spacing(theme::SPACE_4)
+            .constraints([Constraint::Fill(34), Constraint::Fill(66)])
+            .areas(content);
+        render_card(ui, details);
+        render_card(ui, camera);
+
+        let details_content = theme::layout::padded(details, theme::SPACE_5, theme::SPACE_4);
+        let status_height = (details_content.height * 0.24).clamp(76.0, 128.0);
+        let [details_label, instruction, status] = Layout::default()
+            .direction(Direction::Vertical)
+            .spacing(theme::SPACE_3)
             .constraints([
                 Constraint::Length(theme::SPACE_4),
                 Constraint::Fill(1),
-                Constraint::Length(STATUS_HEIGHT),
-                Constraint::Length(theme::BUTTON_HEIGHT),
+                Constraint::Length(status_height),
             ])
             .areas(details_content);
-
         Text::new(&self.details_label)
             .color(theme::ACCENT)
             .text_size(theme::TEXT_LABEL)
             .text_weight(600)
             .render(ui, details_label);
-
         Text::new(&self.instruction)
             .color(theme::TEXT_SECONDARY)
             .text_size(theme::TEXT_BODY)
             .wrap(TextWrap::Word)
             .render(ui, instruction);
 
-        // pairing status
-
         Rectangle::new(status)
-            .background(self.status_background)
-            .border(theme::BORDER_WIDTH, self.status_color)
+            .background(theme::ACCENT_SUBTLE)
+            .border(theme::BORDER_WIDTH, theme::ACCENT)
             .uniform_radius(theme::RADIUS_MEDIUM)
             .render(ui);
         let status_content = theme::layout::padded(status, theme::SPACE_4, theme::SPACE_3);
@@ -258,13 +158,11 @@ impl Page {
             .spacing(theme::SPACE_2)
             .constraints([Constraint::Length(theme::SPACE_5), Constraint::Fill(1)])
             .areas(status_content);
-
         Text::new(&self.status_label)
-            .color(self.status_color)
+            .color(theme::ACCENT)
             .text_size(theme::TEXT_LABEL)
             .text_weight(600)
             .render(ui, status_label);
-
         let [indicator, status_text] = Layout::default()
             .spacing(theme::SPACE_2)
             .constraints([
@@ -277,12 +175,10 @@ impl Page {
             .align(LayoutAlign::Center)
             .constraints([Constraint::Length(STATUS_INDICATOR_SIZE)])
             .areas(indicator);
-
         Rectangle::new(indicator)
-            .background(self.status_color)
+            .background(theme::ACCENT)
             .uniform_radius(STATUS_INDICATOR_SIZE / 2.0)
             .render(ui);
-
         Text::new(&self.status)
             .color(theme::TEXT)
             .text_size(theme::TEXT_STATUS)
@@ -290,33 +186,12 @@ impl Page {
             .vertical_align(VerticalAlign::Center)
             .render(ui, status_text);
 
-        let reset_clicked = Button::new(&self.reset_label)
-            .id("restart pairing")
-            .background(theme::SURFACE_SUBTLE)
-            .clicked_background(theme::SURFACE_PRESSED)
-            .border_width(0.0)
-            .uniform_radius(theme::RADIUS_LARGE)
-            .text_color(theme::TEXT)
-            .text_size(theme::TEXT_BODY)
-            .text_weight(600)
-            .text_options(TextOptions {
-                horizontal_align: HorizontalAlign::Center,
-                vertical_align: VerticalAlign::Center,
-                ..TextOptions::default()
-            })
-            .padding_x(theme::SPACE_6)
-            .render(ui, reset)
-            .clicked();
-
-        // camera preview
-
-        let camera_content = theme::layout::padded(camera, theme::SPACE_4, theme::SPACE_4);
+        let camera_content = theme::layout::padded(camera, theme::SPACE_4, theme::SPACE_3);
         let [camera_label, preview] = Layout::default()
             .direction(Direction::Vertical)
             .spacing(theme::SPACE_3)
             .constraints([Constraint::Length(theme::SPACE_5), Constraint::Fill(1)])
             .areas(camera_content);
-
         Text::new(&self.camera_label)
             .color(theme::ACCENT)
             .text_size(theme::TEXT_LABEL)
@@ -330,11 +205,9 @@ impl Page {
             bottom_left: theme::RADIUS_MEDIUM,
         };
         let mut clipped = ui.begin_rounded_clip(preview, radius);
-
         Rectangle::new(preview)
             .background(theme::PREVIEW)
             .render(&mut clipped);
-
         Image::new(&self.preview)
             .fit(ImageFit::Contain)
             .sampling(ImageSampling::Nearest)
@@ -350,26 +223,16 @@ impl Page {
             .align(LayoutAlign::Center)
             .constraints([Constraint::Length(guide_size)])
             .areas(guide);
-
         Rectangle::new(guide)
             .border(theme::GUIDE_WIDTH, theme::PREVIEW_GUIDE)
             .uniform_radius(theme::RADIUS_MEDIUM)
             .render(&mut clipped);
-
         Rectangle::new(preview)
             .border(theme::BORDER_WIDTH, theme::BORDER)
             .radius(radius)
             .render(&mut clipped);
 
-        if reset_clicked {
-            self.scanning = true;
-            self.status_color = theme::ACCENT;
-            self.status_background = theme::ACCENT_SUBTLE;
-            self.status.replace("Looking for a pairing QR code…");
-            Some(Action::Reset)
-        } else {
-            target.map(Action::Pair)
-        }
+        target
     }
 }
 
@@ -410,7 +273,6 @@ fn start_camera(events: EventLoopProxy<Event>) -> Camera {
                 && (format.stride == 0 || format.stride == format.width)
         })
         .unwrap();
-
     let format = device
         .set_format(&Format::new(CAMERA_WIDTH, CAMERA_HEIGHT, format.fourcc))
         .unwrap_or(format);

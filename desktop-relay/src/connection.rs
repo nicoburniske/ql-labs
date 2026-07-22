@@ -33,8 +33,19 @@ const NOTIFY_UUID: Uuid = Uuid::from_u128(0x6E400003_B5A3_F393_E0A9_E50E24DCCA9E
 pub enum Event {
     Searching,
     Connecting,
-    Peer(PeerStatus),
+    BluetoothConnected,
+    Peer(Peer),
+    Status(PeerStatus),
+    Provisioning,
+    Ready,
     Failed,
+    ProvisioningFailed,
+}
+
+#[derive(Clone)]
+pub struct Peer {
+    pub name: String,
+    pub qid: String,
 }
 
 #[derive(Clone)]
@@ -80,8 +91,8 @@ impl Connection {
         self.0.try_send(Command::Pair(target)).unwrap();
     }
 
-    pub fn reset(&self) {
-        self.0.try_send(Command::Reset).ok();
+    pub fn unpair(&self) {
+        self.0.try_send(Command::Unpair).ok();
     }
 
     pub async fn write(&self, record: Vec<u8>) -> bool {
@@ -121,7 +132,7 @@ impl Target {
 
 enum Command {
     Pair(Target),
-    Reset,
+    Unpair,
     Write(Vec<u8>, oneshot::Sender<bool>),
     Peer(PeerBundle),
     Status(Option<QID>, PeerStatus),
@@ -181,12 +192,17 @@ async fn run_connection(
 
         match step {
             ConnectionStep::Command(None) => break,
-            ConnectionStep::Command(Some(Command::Reset)) => {
+            ConnectionStep::Command(Some(Command::Unpair)) => {
                 pairing = None;
-                handle.close_session(SessionCloseCode::CANCELLED);
+                handle.unpair();
             }
             ConnectionStep::Command(Some(Command::Peer(value))) => peer = Some(value),
             ConnectionStep::Command(Some(Command::Status(qid, status))) => {
+                if status == PeerStatus::Unpaired {
+                    pairing = None;
+                    peer = None;
+                    continue;
+                }
                 if status != PeerStatus::Connected || qid != pairing {
                     continue;
                 }
@@ -197,6 +213,10 @@ async fn run_connection(
                 };
                 let router = relay.router.clone();
                 let handle = handle.clone();
+                let events = events.clone();
+                events
+                    .send_event(crate::Event::Connection(Event::Provisioning))
+                    .ok();
                 tokio::task::spawn_local(async move {
                     let bundles = match (
                         std::fs::read("ql-router-bundle.bin"),
@@ -208,6 +228,9 @@ async fn run_connection(
                         },
                         (Err(error), _) | (_, Err(error)) => {
                             eprintln!("reading peer bundles failed: {error}");
+                            events
+                                .send_event(crate::Event::Connection(Event::ProvisioningFailed))
+                                .ok();
                             return;
                         }
                     };
@@ -220,12 +243,27 @@ async fn run_connection(
                             eprintln!("installed router and Foundation peer bundles");
                             if router.send(RouterMessage::Attach(peer)).await.is_err() {
                                 eprintln!("QL router stopped before peer attachment");
+                                events
+                                    .send_event(crate::Event::Connection(Event::ProvisioningFailed))
+                                    .ok();
+                            } else {
+                                events
+                                    .send_event(crate::Event::Connection(Event::Ready))
+                                    .ok();
                             }
                         }
                         Ok(InstallPeerBundlesResponse::Rejected) => {
                             eprintln!("Passport rejected peer bundles");
+                            events
+                                .send_event(crate::Event::Connection(Event::ProvisioningFailed))
+                                .ok();
                         }
-                        Err(error) => eprintln!("installing peer bundles failed: {error}"),
+                        Err(error) => {
+                            eprintln!("installing peer bundles failed: {error}");
+                            events
+                                .send_event(crate::Event::Connection(Event::ProvisioningFailed))
+                                .ok();
+                        }
                     }
                 });
             }
@@ -356,6 +394,9 @@ async fn run_connection(
                     }
                 }
 
+                events
+                    .send_event(crate::Event::Connection(Event::BluetoothConnected))
+                    .ok();
                 let qid = target.invite.qid;
                 pairing = Some(qid);
                 handle.start_pairing(target.invite);

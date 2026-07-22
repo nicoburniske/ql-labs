@@ -9,19 +9,19 @@ pub const SPACE_4: f32 = 16.0;
 pub const SPACE_5: f32 = 20.0;
 pub const SPACE_6: f32 = 24.0;
 
-pub const RADIUS_MEDIUM: f32 = 16.0;
-pub const RADIUS_LARGE: f32 = 24.0;
+pub const RADIUS_MEDIUM: f32 = 12.0;
+pub const RADIUS_LARGE: f32 = 18.0;
 pub const BORDER_WIDTH: f32 = 1.0;
-pub const GUIDE_WIDTH: f32 = 3.0;
-pub const SHADOW_OFFSET: f32 = 2.0;
+pub const GUIDE_WIDTH: f32 = 2.0;
+pub const SHADOW_OFFSET: f32 = 3.0;
 pub const SHADOW_BLUR: f32 = SPACE_2;
 
-pub const TEXT_LABEL: f32 = 13.0;
+pub const TEXT_LABEL: f32 = 12.0;
 pub const TEXT_STATUS: f32 = 16.0;
 pub const TEXT_BODY: f32 = 18.0;
-pub const TEXT_TITLE: f32 = 30.0;
-pub const TITLE_HEIGHT: f32 = 56.0;
-pub const BUTTON_HEIGHT: f32 = 60.0;
+pub const TEXT_TITLE: f32 = 28.0;
+pub const TITLE_HEIGHT: f32 = 54.0;
+pub const BUTTON_HEIGHT: f32 = 52.0;
 
 pub const BACKGROUND: Color = Color::from_rgba8(17, 17, 17, 255);
 pub const SURFACE: Color = Color::from_rgba8(35, 31, 32, 255);

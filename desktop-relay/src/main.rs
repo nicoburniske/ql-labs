@@ -1,5 +1,5 @@
 mod connection;
-mod pairing;
+mod pages;
 mod platform;
 mod theme;
 
@@ -47,7 +47,7 @@ enum Event {
 
 struct App {
     connection: connection::Connection,
-    pairing: pairing::Page,
+    pages: pages::Pages,
 }
 
 impl Application for App {
@@ -56,21 +56,21 @@ impl Application for App {
     fn new(platform: Platform, events: EventLoopProxy<Self::Input>, _ops: Ops<Self>) -> Self {
         Self {
             connection: connection::Connection::new(events.clone()),
-            pairing: pairing::Page::new(platform, events),
+            pages: pages::Pages::new(platform, events),
         }
     }
 
     fn input(&mut self, event: Self::Input) {
         if let Event::Connection(event) = event {
-            self.pairing.input(event);
+            self.pages.input(event);
         }
     }
 
     fn render(&mut self, ui: &mut Ui) {
-        if let Some(action) = self.pairing.render(ui) {
+        if let Some(action) = self.pages.render(ui) {
             match action {
-                pairing::Action::Pair(target) => self.connection.pair(target),
-                pairing::Action::Reset => self.connection.reset(),
+                pages::Action::Pair(target) => self.connection.pair(target),
+                pages::Action::StartOver | pages::Action::Unpair => self.connection.unpair(),
             }
         }
     }

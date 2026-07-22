@@ -54,6 +54,14 @@ impl QlPlatform for Platform {
 
     fn persist_peer(&self, peer: PeerBundle) {
         eprintln!("paired QID {} ({})", hex::encode(peer.qid.0), peer.name);
+        self.events
+            .send_event(crate::Event::Connection(Event::Peer(
+                crate::connection::Peer {
+                    qid: hex::encode(peer.qid.0),
+                    name: peer.name.clone(),
+                },
+            )))
+            .ok();
         self.connection.peer(peer);
     }
 
@@ -64,7 +72,7 @@ impl QlPlatform for Platform {
         );
         self.connection.status(peer, status);
         self.events
-            .send_event(crate::Event::Connection(Event::Peer(status)))
+            .send_event(crate::Event::Connection(Event::Status(status)))
             .ok();
     }
 
