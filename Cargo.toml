@@ -26,7 +26,7 @@ ql-keyos = { path = "../foundation-api/ql-keyos" }
 ql-rpc = { path = "../foundation-api/ql-rpc" }
 ql-runtime = { path = "../foundation-api/ql-runtime", features = ["rpc"] }
 ql-wire = { path = "../foundation-api/ql-wire", features = ["test-utils"] }
-rxing = { version = "0.7.1", default-features = false }
+rxing = { version = "0.9.1", default-features = false, features = ["decoders", "encoding_rs", "qrcode"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }

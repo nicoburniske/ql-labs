@@ -1,5 +1,7 @@
-use std::{collections::HashSet, thread::JoinHandle, time::Duration};
+use std::{collections::HashSet, thread::JoinHandle};
 
+use super::{render_card, render_page};
+use crate::{connection, theme};
 use async_channel::Receiver;
 use blit::{
     Ui,
@@ -9,100 +11,60 @@ use blit::{
     resource::{ImageData, ImageFormat, ImageHandle, ImagePixels},
     widget::{Image, Text},
 };
+use blit_desktop::Scope;
 use rxing::{
     BarcodeFormat, BinaryBitmap, DecodeHints, Luma8LuminanceSource, MultiFormatReader,
     common::HybridBinarizer,
 };
 
-use super::{render_card, render_page};
-use crate::{connection, theme};
-use blit_desktop::Scope;
-
 pub struct Page {
     _scope: Scope<Self>,
     camera: Camera,
-    scanner: MultiFormatReader,
     platform: Platform,
     preview: ImageHandle,
     frame: Option<Box<[u8]>>,
+    target: Option<connection::Target>,
 }
 
 impl Page {
     pub fn new(platform: Platform, mut scope: Scope<Self>) -> Self {
-        let mut scanner = MultiFormatReader::default();
-        scanner.set_hints(&DecodeHints {
-            PossibleFormats: Some(HashSet::from([BarcodeFormat::QR_CODE])),
-            TryHarder: Some(true),
-            AlsoInverted: Some(true),
-            ..Default::default()
-        });
         let (camera, frames) = start_camera();
         scope.spawn(async move |cx| {
             while let Ok(frame) = frames.recv().await {
                 cx.app().set_camera_frame(frame);
+                futures_lite::future::yield_now().await;
             }
         });
         Self {
             _scope: scope,
             camera,
-            scanner,
             platform,
             preview: ImageHandle::default(),
             frame: None,
+            target: None,
         }
     }
 
-    fn set_camera_frame(&mut self, frame: Box<[u8]>) {
-        self.frame = Some(frame);
+    fn set_camera_frame(&mut self, frame: CameraFrame) {
+        self.frame = Some(frame.luma);
+        if frame.target.is_some() {
+            self.target = frame.target;
+        }
     }
 
     pub fn render(&mut self, ui: &mut Ui) -> Option<connection::Target> {
-        const QR_SCAN_INTERVAL: Duration = Duration::from_millis(50);
+        const QR_GUIDE_SCALE: f32 = 0.75;
         const STATUS_INDICATOR_SIZE: f32 = 8.0;
 
-        let scan = ui.timer_loop(ui.id("qr scan"), QR_SCAN_INTERVAL);
-        let luma = self.frame.take();
-        let target = if let Some(luma) = luma {
-            let target = if scan {
-                let scan_size = self.camera.width.min(self.camera.height);
-                let scan_left = (self.camera.width - scan_size) / 2;
-                let scan_top = (self.camera.height - scan_size) / 2;
-                let mut scan_frame = Vec::with_capacity(scan_size * scan_size);
-                for row in luma
-                    .chunks_exact(self.camera.width)
-                    .skip(scan_top)
-                    .take(scan_size)
-                {
-                    scan_frame.extend_from_slice(&row[scan_left..scan_left + scan_size]);
-                }
-                let mut bitmap = BinaryBitmap::new(HybridBinarizer::new(
-                    Luma8LuminanceSource::new(scan_frame, scan_size as u32, scan_size as u32),
-                ));
-                self.scanner
-                    .decode_with_state(&mut bitmap)
-                    .ok()
-                    .and_then(|decoded| {
-                        let bytes = decoded.getRawBytes();
-                        let bytes = if bytes.is_empty() {
-                            decoded.getText().as_bytes()
-                        } else {
-                            bytes
-                        };
-                        connection::Target::parse(std::str::from_utf8(bytes).ok()?)
-                    })
-            } else {
-                None
-            };
+        if let Some(luma) = self.frame.take() {
             self.preview = self.platform.create_image(ImageData::new(
                 ImagePixels::Owned(luma),
                 ImageFormat::Luma8,
                 self.camera.width,
                 self.camera.height,
             ));
-            target
-        } else {
-            None
-        };
+        }
+        let target = self.target.take();
 
         let content = render_page(ui, "Pair Passport", "Secure Bluetooth pairing");
         let [details, camera] = Layout::default()
@@ -200,7 +162,7 @@ impl Page {
             .sampling(ImageSampling::Nearest)
             .render(&mut clipped, preview);
 
-        let guide_size = preview.width.min(preview.height) * 0.75;
+        let guide_size = preview.width.min(preview.height) * QR_GUIDE_SCALE;
         let [guide] = Layout::default()
             .align(LayoutAlign::Center)
             .constraints([Constraint::Length(guide_size)])
@@ -229,13 +191,18 @@ struct Camera {
     height: usize,
 }
 
+struct CameraFrame {
+    luma: Box<[u8]>,
+    target: Option<connection::Target>,
+}
+
 impl Drop for Camera {
     fn drop(&mut self) {
         self.thread.take().unwrap().join().unwrap();
     }
 }
 
-fn start_camera() -> (Camera, Receiver<Box<[u8]>>) {
+fn start_camera() -> (Camera, Receiver<CameraFrame>) {
     use v4l::{
         Format, FourCC,
         buffer::Type,
@@ -276,12 +243,44 @@ fn start_camera() -> (Camera, Receiver<Box<[u8]>>) {
     let height = format.height as usize;
     let (frames, receiver) = async_channel::bounded(2);
     let thread = std::thread::spawn(move || {
+        const QR_SCAN_EVERY: u64 = 3;
+
+        let mut scanner = MultiFormatReader::default();
+        scanner.set_hints(&DecodeHints {
+            PossibleFormats: Some(HashSet::from([BarcodeFormat::QR_CODE])),
+            TryHarder: Some(true),
+            AlsoInverted: Some(true),
+            ..Default::default()
+        });
+        let mut produced = 0_u64;
         loop {
             let (camera_frame, _) = stream.next().unwrap();
-            if frames
-                .force_send(camera_frame[..width * height].into())
-                .is_err()
-            {
+            produced += 1;
+            let luma: Box<[u8]> = camera_frame[..width * height].into();
+            let target = if produced.is_multiple_of(QR_SCAN_EVERY) {
+                let mut scan_frame = luma.to_vec();
+                let minimum = scan_frame.iter().copied().min().unwrap();
+                let maximum = scan_frame.iter().copied().max().unwrap();
+                let threshold = ((minimum as u16 + maximum as u16) / 2) as u8;
+                for pixel in &mut scan_frame {
+                    *pixel = if *pixel >= threshold { 255 } else { 0 };
+                }
+                let mut bitmap = BinaryBitmap::new(HybridBinarizer::new(
+                    Luma8LuminanceSource::new(scan_frame, width as u32, height as u32),
+                ));
+                scanner
+                    .decode_with_state(&mut bitmap)
+                    .ok()
+                    .and_then(|decoded| connection::Target::parse(decoded.getText()))
+            } else {
+                None
+            };
+            let frame = CameraFrame { luma, target };
+            if frame.target.is_some() {
+                let _ = frames.send_blocking(frame);
+                break;
+            }
+            if frames.force_send(frame).is_err() {
                 break;
             }
         }
