@@ -9,6 +9,7 @@ edition = "2024"
 anyhow = "1"
 async-channel = "2"
 dashmap = "6"
+figment = { version = "0.10", features = ["env"] }
 hex = "0.4"
 ql-api = { git = "https://github.com/Foundation-Devices/foundation-api.git", branch = "ql-v2-shared-api" }
 ql-codec = { git = "https://github.com/Foundation-Devices/foundation-api.git", branch = "ql-v2-shared-api" }
@@ -17,6 +18,7 @@ ql-fsm = { git = "https://github.com/Foundation-Devices/foundation-api.git", bra
 ql-router = { path = "ql-router" }
 ql-runtime = { git = "https://github.com/Foundation-Devices/foundation-api.git", branch = "ql-v2-shared-api", features = ["rpc"] }
 ql-wire = { git = "https://github.com/Foundation-Devices/foundation-api.git", branch = "ql-v2-shared-api", features = ["test-utils"] }
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

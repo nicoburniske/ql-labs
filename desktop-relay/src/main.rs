@@ -6,12 +6,28 @@ mod theme;
 use blit::{Ui, paint::FontId, platform::Platform};
 use blit_cpu::{Font, FontFace, RendererConfig};
 use blit_desktop::{Application, Config, EventLoopProxy, Root};
+use figment::{
+    Figment,
+    providers::{Env, Serialized},
+};
+use serde::{Deserialize, Serialize};
 
-fn main() {
-    let log_level = std::env::var("QL_DESKTOP_LOG")
-        .ok()
-        .and_then(|level| level.parse::<tracing::Level>().ok())
-        .unwrap_or(tracing::Level::INFO);
+#[derive(Deserialize, Serialize)]
+struct AppConfig {
+    log: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self { log: "INFO".into() }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let config: AppConfig = Figment::from(Serialized::defaults(AppConfig::default()))
+        .merge(Env::prefixed("QL_DESKTOP_"))
+        .extract()?;
+    let log_level: tracing::Level = config.log.parse()?;
     tracing_subscriber::fmt().with_max_level(log_level).init();
 
     let mut fonts = fontdb::Database::new();
@@ -43,7 +59,8 @@ fn main() {
             shadow_cache_capacity: 32 * 1024 * 1024,
         },
     })
-    .unwrap();
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(())
 }
 
 struct App {

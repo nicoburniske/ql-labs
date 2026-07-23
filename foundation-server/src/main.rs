@@ -1,10 +1,13 @@
 mod platform;
 mod rpc;
 
-use std::{fs, io::ErrorKind, os::unix::fs::PermissionsExt, sync::Arc};
+use std::{fs, io::ErrorKind, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
 use dashmap::DashMap;
+use figment::{
+    Figment,
+    providers::{Env, Serialized},
+};
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
 use ql_router::{DEFAULT_ADDRESS, attach, connect_udp, receive, send};
@@ -13,11 +16,38 @@ use ql_wire::{
     PeerBundle, QlHandshakeRecord, QlIdentity, RecordHeader, RecordType, SoftwareCrypto,
     answer_peer_challenge, generate_identity,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::platform::Platform;
 
 type Peers = Arc<DashMap<QID, Peer>>;
+
+#[derive(Deserialize, Serialize)]
+struct Config {
+    identity_path: PathBuf,
+    bundle_path: PathBuf,
+    router: RouterConfig,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RouterConfig {
+    bundle_path: PathBuf,
+    address: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            identity_path: "foundation-server/identity.bin".into(),
+            bundle_path: "foundation-server/bundle.bin".into(),
+            router: RouterConfig {
+                bundle_path: "ql-router/bundle.bin".into(),
+                address: DEFAULT_ADDRESS.into(),
+            },
+        }
+    }
+}
 
 struct Peer {
     inbound: mpsc::Sender<Vec<u8>>,
@@ -25,48 +55,38 @@ struct Peer {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
+    let config: Config = Figment::from(Serialized::defaults(Config::default()))
+        .merge(Env::prefixed("QL_FOUNDATION_"))
+        .merge(Env::prefixed("QL_ROUTER_").map(|key| format!("router.{key}").into()))
+        .extract()?;
     let crypto = SoftwareCrypto;
-    let identity_path = std::env::var("QL_FOUNDATION_IDENTITY_PATH")
-        .unwrap_or_else(|_| "foundation-server/identity.bin".into());
-    let identity = match fs::read(&identity_path) {
-        Ok(bytes) => {
-            QlIdentity::decode_bytes(bytes.as_slice()).context("decoding foundation identity")?
-        }
+    let identity = match fs::read(&config.identity_path) {
+        Ok(bytes) => QlIdentity::decode_bytes(bytes.as_slice())?,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             let identity = generate_identity(&crypto, "Foundation Server");
-            fs::write(&identity_path, identity.encode_vec())
-                .context("persisting foundation identity")?;
+            fs::write(&config.identity_path, identity.encode_vec())?;
             identity
         }
-        Err(error) => return Err(error).context("reading foundation identity"),
+        Err(error) => return Err(error.into()),
     };
-    fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))
-        .context("securing foundation identity")?;
-    let bundle_path = std::env::var("QL_FOUNDATION_BUNDLE_PATH")
-        .unwrap_or_else(|_| "foundation-server/bundle.bin".into());
-    fs::write(&bundle_path, identity.bundle().encode_vec())
-        .context("writing foundation peer bundle")?;
+    fs::set_permissions(&config.identity_path, fs::Permissions::from_mode(0o600))?;
+    fs::write(&config.bundle_path, identity.bundle().encode_vec())?;
     eprintln!("Foundation server QID: {}", hex::encode(identity.qid.0));
-    eprintln!("Foundation server peer bundle: {bundle_path}");
+    eprintln!(
+        "Foundation server peer bundle: {}",
+        config.bundle_path.display()
+    );
 
-    let router_bundle_path =
-        std::env::var("QL_ROUTER_BUNDLE_PATH").unwrap_or_else(|_| "ql-router/bundle.bin".into());
-    let router_bundle = fs::read(&router_bundle_path).context("reading router peer bundle")?;
-    let router = PeerBundle::decode_bytes(router_bundle.as_slice())
-        .context("decoding router peer bundle")?;
-    let address = std::env::var("QL_ROUTER_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.into());
-    let (mut reader, mut writer) = connect_udp(&address, &router).await?;
+    let router_bundle = fs::read(&config.router.bundle_path)?;
+    let router = PeerBundle::decode_bytes(router_bundle.as_slice())?;
+    let (mut reader, mut writer) = connect_udp(&config.router.address, &router).await?;
 
     attach(&mut writer, &identity.bundle()).await?;
-    let request = receive(&mut reader)
-        .await?
-        .context("router disconnected during registration")?;
+    let request = receive(&mut reader).await?.unwrap();
     let (response, pending) = answer_peer_challenge(&crypto, &identity, router, &request)?;
     send(&mut writer, &response).await?;
-    let mut accepted = receive(&mut reader)
-        .await?
-        .context("router disconnected before accepting the route")?;
+    let mut accepted = receive(&mut reader).await?.unwrap();
     pending.verify(&crypto, &mut accepted)?;
 
     eprintln!("Foundation server registered with QL router");

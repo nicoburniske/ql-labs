@@ -12,6 +12,7 @@ blit-cpu = { git = "https://github.com/nicoburniske/blit.git" }
 blit-desktop = { git = "https://github.com/nicoburniske/blit.git" }
 btleplug = "0.11"
 btp = { git = "https://github.com/Foundation-Devices/foundation-api.git", branch = "ql-v2-shared-api" }
+figment.workspace = true
 fontdb = "0.23"
 futures-lite = "2.6"
 hex.workspace = true
@@ -23,6 +24,7 @@ ql-router.workspace = true
 ql-runtime.workspace = true
 ql-wire.workspace = true
 rxing = { version = "0.9.1", default-features = false, features = ["decoders", "encoding_rs", "qrcode"] }
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

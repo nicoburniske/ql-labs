@@ -1,6 +1,6 @@
 use std::{pin::Pin, time::Duration};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::anyhow;
 use btleplug::{
     api::{
         Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, ValueNotification,
@@ -368,14 +368,13 @@ async fn run_connection(
                     if let Some(bluetooth) = bluetooth.take() {
                         bluetooth.peripheral.disconnect().await.ok();
                     }
-                    let result: Result<Bluetooth> = async {
+                    let result: anyhow::Result<Bluetooth> = async {
                         tracing::info!(address = %target.address, "searching for Passport");
                         adapter
                             .start_scan(ScanFilter {
                                 services: vec![NUS_UUID],
                             })
-                            .await
-                            .context("starting Bluetooth scan")?;
+                            .await?;
                         let peripheral = tokio::time::timeout(Duration::from_secs(30), async {
                             loop {
                                 for peripheral in adapter.peripherals().await? {
@@ -395,46 +394,29 @@ async fn run_connection(
                         })
                         .await
                         .map_err(|_| anyhow!("Passport was not found within 30 seconds"));
-                        adapter
-                            .stop_scan()
-                            .await
-                            .context("stopping Bluetooth scan")?;
+                        adapter.stop_scan().await?;
                         let peripheral = peripheral??;
 
                         states.send_modify(|state| state.phase = Phase::Connecting);
-                        if !peripheral
-                            .is_connected()
-                            .await
-                            .context("checking Bluetooth connection")?
-                        {
-                            peripheral
-                                .connect()
-                                .await
-                                .context("connecting to Passport")?;
+                        if !peripheral.is_connected().await? {
+                            peripheral.connect().await?;
                         }
-                        peripheral
-                            .discover_services()
-                            .await
-                            .context("discovering Passport services")?;
+                        peripheral.discover_services().await?;
                         let characteristics = peripheral.characteristics();
                         let write = characteristics
                             .iter()
                             .find(|characteristic| characteristic.uuid == WRITE_UUID)
                             .cloned()
-                            .context("Passport write characteristic unavailable")?;
+                            .ok_or_else(|| anyhow!("Passport write characteristic unavailable"))?;
                         let notify = characteristics
                             .iter()
                             .find(|characteristic| characteristic.uuid == NOTIFY_UUID)
                             .cloned()
-                            .context("Passport notification characteristic unavailable")?;
-                        peripheral
-                            .subscribe(&notify)
-                            .await
-                            .context("subscribing to Passport notifications")?;
-                        let notifications = peripheral
-                            .notifications()
-                            .await
-                            .context("opening Passport notifications")?;
+                            .ok_or_else(|| {
+                                anyhow!("Passport notification characteristic unavailable")
+                            })?;
+                        peripheral.subscribe(&notify).await?;
+                        let notifications = peripheral.notifications().await?;
                         Ok(Bluetooth {
                             address: target.address.clone(),
                             peripheral,
@@ -569,7 +551,7 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
         let router = match std::fs::read("ql-router/bundle.bin")
             .map_err(anyhow::Error::from)
             .and_then(|bytes| {
-                PeerBundle::decode_bytes(bytes.as_slice()).context("decoding router peer bundle")
+                PeerBundle::decode_bytes(bytes.as_slice()).map_err(anyhow::Error::from)
             }) {
             Ok(router) => router,
             Err(error) => {

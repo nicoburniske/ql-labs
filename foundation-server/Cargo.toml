@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 dashmap.workspace = true
+figment.workspace = true
 hex.workspace = true
 ql-api.workspace = true
 ql-codec.workspace = true
@@ -17,5 +18,6 @@ ql-rpc = { git = "https://github.com/Foundation-Devices/foundation-api.git", bra
 ql-router.workspace = true
 ql-runtime = { workspace = true, features = ["rpc"] }
 ql-wire.workspace = true
+serde.workspace = true
 sha2 = "0.10"
 tokio.workspace = true

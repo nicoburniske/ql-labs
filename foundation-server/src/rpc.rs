@@ -1,6 +1,5 @@
 use std::future::Future;
 
-use anyhow::{Context, Result};
 use ql_api::{
     DownloadBenchmark, DownloadBenchmarkHeader, DownloadBenchmarkParams,
     DownloadBenchmarkPartHeader, EchoParams, EchoResponse, RequestEcho,
@@ -75,7 +74,7 @@ impl DownloadHandler<DownloadBenchmark, QlStream> for Service {
             hex::encode(context.qid.0),
             request.length
         );
-        let result: Result<()> = async {
+        let result: anyhow::Result<()> = async {
             let mut pattern = vec![0; CHUNK_LEN];
             for (index, byte) in pattern.iter_mut().enumerate() {
                 *byte = (index % 251) as u8;
@@ -94,26 +93,17 @@ impl DownloadHandler<DownloadBenchmark, QlStream> for Service {
                 .start(DownloadBenchmarkHeader {
                     hash: hasher.finalize().to_vec(),
                 })
-                .await
-                .context("sending download header")?;
-            let mut part = writer
-                .start_part(DownloadBenchmarkPartHeader {})
-                .await
-                .context("starting download part")?;
+                .await?;
+            let mut part = writer.start_part(DownloadBenchmarkPartHeader {}).await?;
 
             remaining = request.length;
             while remaining > 0 {
                 let length = remaining.min(CHUNK_LEN as u64) as usize;
-                part.send(pattern.slice(..length)).await.with_context(|| {
-                    format!(
-                        "sending download after {} bytes",
-                        request.length - remaining
-                    )
-                })?;
+                part.send(pattern.slice(..length)).await?;
                 remaining -= length as u64;
             }
-            part.finish().await.context("finishing download part")?;
-            writer.finish().await.context("finishing download")?;
+            part.finish().await?;
+            writer.finish().await?;
             Ok(())
         }
         .await;

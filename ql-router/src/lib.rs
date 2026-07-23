@@ -328,7 +328,7 @@ pub mod protocol {
     use std::{io, mem::size_of};
 
     use hkdf::Hkdf;
-    use ql_codec::{Decode, Encode};
+    use ql_codec::{Decode, Encode, codec};
     use ql_wire::{
         ENCRYPTED_MESSAGE_AUTH_SIZE, FinalizedHandshake, Nonce, QlAead, QlHandshakeRecord,
         RecordHeader, SessionKey, SoftwareCrypto,
@@ -347,7 +347,7 @@ pub mod protocol {
     const PACKET_HEADER_SIZE: usize = size_of::<u8>() + size_of::<u64>() * 2;
     const UDP_KEY_INFO: &[u8] = b"ql-router:transport-keys:v1:udp";
 
-    ql_codec::codec! {
+    codec! {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum PacketKind {
             Confirm = 1,
@@ -358,7 +358,7 @@ pub mod protocol {
         }
     }
 
-    ql_codec::codec! {
+    codec! {
         pub struct PacketHeader {
             pub version_and_kind: u8,
             pub session_id: u64,
@@ -366,7 +366,7 @@ pub mod protocol {
         }
     }
 
-    ql_codec::codec! {
+    codec! {
         pub struct TransportResponse {
             pub session_id: u64,
             pub max_udp_payload: u32,
@@ -375,7 +375,7 @@ pub mod protocol {
         }
     }
 
-    ql_codec::codec! {
+    codec! {
         pub struct TransportConfirmation {
             pub max_udp_payload: u32,
         }

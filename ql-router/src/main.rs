@@ -5,15 +5,19 @@ use std::{
     io::{self, ErrorKind},
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
+    path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
 
-use anyhow::{Context, Result};
 use async_channel::{Sender, TrySendError};
 use dashmap::DashMap;
+use figment::{
+    Figment,
+    providers::{Env, Serialized},
+};
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
 use ql_router::{
@@ -25,6 +29,7 @@ use ql_wire::{
     RecordHeader, RecordType, RouteHeader, SessionKey, SoftwareCrypto, TransportParams,
     generate_identity,
 };
+use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Semaphore, SemaphorePermit, mpsc, oneshot},
@@ -39,6 +44,27 @@ const MAX_PENDING_HANDSHAKES: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type ConnectionId = u64;
+
+#[derive(Deserialize, Serialize)]
+struct Config {
+    log: String,
+    address: String,
+    udp_max_payload: usize,
+    identity_path: PathBuf,
+    bundle_path: PathBuf,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            log: "INFO".into(),
+            address: DEFAULT_ADDRESS.into(),
+            udp_max_payload: DEFAULT_UDP_PAYLOAD,
+            identity_path: "ql-router/identity.bin".into(),
+            bundle_path: "ql-router/bundle.bin".into(),
+        }
+    }
+}
 
 struct ActiveChallenge {
     pending: PeerChallenge<&'static QlIdentity>,
@@ -98,45 +124,34 @@ struct HandshakeExecutor {
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
-    let log_level = std::env::var("QL_ROUTER_LOG")
-        .ok()
-        .and_then(|level| Level::from_str(&level).ok())
-        .unwrap_or(Level::INFO);
-    tracing_subscriber::fmt().with_max_level(log_level).init();
+async fn main() -> anyhow::Result<()> {
+    let config: Config = Figment::from(Serialized::defaults(Config::default()))
+        .merge(Env::prefixed("QL_ROUTER_"))
+        .extract()?;
+    tracing_subscriber::fmt()
+        .with_max_level(Level::from_str(&config.log)?)
+        .init();
 
-    let address = std::env::var("QL_ROUTER_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.into());
-    let listener = TcpListener::bind(&address).await?;
+    let listener = TcpListener::bind(&config.address).await?;
     let udp = UdpSocket::bind(listener.local_addr()?).await?;
-    let udp_max_payload = std::env::var("QL_ROUTER_UDP_MAX_PAYLOAD")
-        .map_or(Ok(DEFAULT_UDP_PAYLOAD), |value| value.parse::<usize>())
-        .context("parsing QL_ROUTER_UDP_MAX_PAYLOAD")?;
+    let udp_max_payload = config.udp_max_payload;
     if udp_max_payload > protocol::MAX_UDP_PAYLOAD {
         anyhow::bail!("invalid QL_ROUTER_UDP_MAX_PAYLOAD");
     }
 
-    let identity_path = std::env::var("QL_ROUTER_IDENTITY_PATH")
-        .unwrap_or_else(|_| "ql-router/identity.bin".into());
-    let identity = match fs::read(&identity_path) {
-        Ok(bytes) => {
-            QlIdentity::decode_bytes(bytes.as_slice()).context("decoding router identity")?
-        }
+    let identity = match fs::read(&config.identity_path) {
+        Ok(bytes) => QlIdentity::decode_bytes(bytes.as_slice())?,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             let identity = generate_identity(&SoftwareCrypto, "QL Router");
-            fs::write(&identity_path, identity.encode_vec())
-                .context("persisting router identity")?;
+            fs::write(&config.identity_path, identity.encode_vec())?;
             identity
         }
-        Err(error) => return Err(error).context("reading router identity"),
+        Err(error) => return Err(error.into()),
     };
-    fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))
-        .context("securing router identity")?;
-    let bundle_path =
-        std::env::var("QL_ROUTER_BUNDLE_PATH").unwrap_or_else(|_| "ql-router/bundle.bin".into());
-    fs::write(&bundle_path, identity.bundle().encode_vec())
-        .context("writing router peer bundle")?;
+    fs::set_permissions(&config.identity_path, fs::Permissions::from_mode(0o600))?;
+    fs::write(&config.bundle_path, identity.bundle().encode_vec())?;
     info!(qid = %hex::encode(identity.qid.0), "QL router identity ready");
-    info!(path = %bundle_path, "QL router peer bundle ready");
+    info!(path = %config.bundle_path.display(), "QL router peer bundle ready");
 
     let handshake_workers = std::thread::available_parallelism()
         .map_or(1, |parallelism| (parallelism.get() / 2).clamp(1, 4));
@@ -162,7 +177,7 @@ async fn main() -> Result<()> {
     run(router, listener).await
 }
 
-async fn run(router: &'static Router, listener: TcpListener) -> Result<()> {
+async fn run(router: &'static Router, listener: TcpListener) -> anyhow::Result<()> {
     tokio::spawn(async move {
         if let Err(error) = serve_udp(router).await {
             tracing::error!(%error, "UDP listener stopped");
@@ -174,7 +189,7 @@ async fn run(router: &'static Router, listener: TcpListener) -> Result<()> {
         let connection = loop {
             let mut random = [0; 8];
             getrandom::getrandom(&mut random).unwrap();
-            let connection = ConnectionId::decode_bytes(random.as_slice()).unwrap();
+            let connection = ConnectionId::from_le_bytes(random);
             if connection != 0 && !router.connections.contains_key(&connection) {
                 break connection;
             }
