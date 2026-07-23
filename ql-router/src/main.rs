@@ -21,8 +21,8 @@ use ql_router::{
     protocol::{self, PacketKind, UdpKeys},
 };
 use ql_wire::{
-    HandshakeId, IkHandshake, PeerBundle, PeerChallenge, QL_WIRE_VERSION, QlHandshakeRecord,
-    QlIdentity, RecordHeader, RecordType, RouteHeader, SessionKey, SoftwareCrypto, TransportParams,
+    HandshakeId, IkHandshake, PeerBundle, PeerChallenge, QlHandshakeRecord, QlIdentity,
+    RecordHeader, RecordType, RouteHeader, SessionKey, SoftwareCrypto, TransportParams,
     generate_identity,
 };
 use tokio::{
@@ -53,7 +53,6 @@ enum ConnectionError {
     ChallengeActive,
     ChallengeMissing,
     ChallengeTimedOut,
-    UnsupportedVersion,
     RouteLimit,
     HandshakeOverloaded,
     HandshakeWorkerStopped,
@@ -132,7 +131,7 @@ async fn main() -> Result<()> {
     let udp_max_payload = std::env::var("QL_ROUTER_UDP_MAX_PAYLOAD")
         .map_or(Ok(DEFAULT_UDP_PAYLOAD), |value| value.parse::<usize>())
         .context("parsing QL_ROUTER_UDP_MAX_PAYLOAD")?;
-    if !(protocol::MIN_UDP_PAYLOAD..=protocol::MAX_UDP_PAYLOAD).contains(&udp_max_payload) {
+    if udp_max_payload > protocol::MAX_UDP_PAYLOAD {
         anyhow::bail!("invalid QL_ROUTER_UDP_MAX_PAYLOAD");
     }
 
@@ -197,7 +196,7 @@ async fn run(listener: TcpListener, router: Arc<Router>) -> Result<()> {
         let connection = loop {
             let mut random = [0; 8];
             getrandom::getrandom(&mut random).unwrap();
-            let connection = ConnectionId::from_be_bytes(random);
+            let connection = ConnectionId::decode_bytes(random.as_slice()).unwrap();
             if connection != 0 && !router.connections.contains_key(&connection) {
                 break connection;
             }
@@ -318,14 +317,13 @@ async fn negotiate_transport(
     router: &Router,
 ) -> ConnectionResult<NegotiatedTransport> {
     let identity = router.identity.clone();
+    let max_udp_payload = router.udp_max_payload;
     let (response, tcp_tx, tcp_rx, udp_keys) = timeout(
         HANDSHAKE_TIMEOUT,
         router.handshakes.run(move || {
             let (header, request) =
                 ql_wire::decode_record::<QlHandshakeRecord, _>(request.as_slice())?;
-            if header.version != QL_WIRE_VERSION
-                || header.route.recipient != identity.qid
-                || header.record_type != RecordType::Handshake
+            if header.route.recipient != identity.qid || header.record_type != RecordType::Handshake
             {
                 return Err(ConnectionError::Protocol);
             }
@@ -340,16 +338,18 @@ async fn negotiate_transport(
             );
             handshake.read_1(&SoftwareCrypto, header.route, &request)?;
             let response = handshake.write_2(&SoftwareCrypto, request.handshake_id)?;
-            let response = ql_wire::encode_record_vec(
-                RecordHeader::new(
+            let response = protocol::TransportResponse {
+                session_id: connection,
+                max_udp_payload: max_udp_payload as u32,
+                header: RecordHeader::new(
                     RouteHeader {
                         sender: header.route.recipient,
                         recipient: header.route.sender,
                     },
                     RecordType::Handshake,
                 ),
-                &QlHandshakeRecord::Ik2(response),
-            );
+                handshake: QlHandshakeRecord::Ik2(response),
+            };
             let finalized = handshake.finalize(&SoftwareCrypto)?;
             let udp_keys = protocol::derive_udp_keys(&finalized);
             Ok((response, finalized.tx_key, finalized.rx_key, udp_keys))
@@ -358,26 +358,20 @@ async fn negotiate_transport(
     .await
     .map_err(|_| ConnectionError::ChallengeTimedOut)??;
 
-    let session_id = connection;
-    let mut payload = Vec::with_capacity(12 + response.len());
-    payload.extend_from_slice(&session_id.to_be_bytes());
-    payload.extend_from_slice(&(router.udp_max_payload as u32).to_be_bytes());
-    payload.extend_from_slice(&response);
-    protocol::write_frame(stream, &payload).await?;
+    let session_id = response.session_id;
+    protocol::write_frame(stream, &response.encode_vec()).await?;
 
     let confirmation = timeout(HANDSHAKE_TIMEOUT, protocol::read_frame(stream))
         .await
         .map_err(|_| ConnectionError::ChallengeTimedOut)??
         .ok_or(ConnectionError::Protocol)?;
     let confirmation = protocol::open_packet(&tcp_rx, session_id, &confirmation)?;
-    if confirmation.kind != PacketKind::Confirm
-        || confirmation.payload.len() != 4
-        || confirmation.number != 0
-    {
+    if confirmation.kind != PacketKind::Confirm || confirmation.number != 0 {
         return Err(ConnectionError::Protocol);
     }
-    let peer_max_payload = u32::from_be_bytes(confirmation.payload.try_into().unwrap()) as usize;
-    if !(protocol::MIN_UDP_PAYLOAD..=protocol::MAX_UDP_PAYLOAD).contains(&peer_max_payload) {
+    let peer_max_payload = protocol::TransportConfirmation::decode_bytes(confirmation.payload)?
+        .max_udp_payload as usize;
+    if peer_max_payload > protocol::MAX_UDP_PAYLOAD {
         return Err(ConnectionError::Protocol);
     }
 
@@ -409,7 +403,10 @@ async fn serve_udp(router: &Router) -> io::Result<()> {
         if packet.len() < protocol::PACKET_OVERHEAD {
             continue;
         }
-        let session_id = u64::from_be_bytes(packet[1..9].try_into().unwrap());
+        let Ok(header) = protocol::PacketHeader::decode_bytes(packet) else {
+            continue;
+        };
+        let session_id = header.session_id;
         let Some(connection) = router
             .connections
             .get(&session_id)
@@ -555,9 +552,6 @@ fn route_record<'a>(
     ingress: ConnectionId,
     router: &Router,
 ) -> ConnectionResult<()> {
-    if header.version != QL_WIRE_VERSION {
-        return Err(ConnectionError::UnsupportedVersion);
-    }
     if router
         .routes
         .get(&header.route.sender)
@@ -695,7 +689,6 @@ impl fmt::Display for ConnectionError {
             Self::ChallengeActive => f.write_str("route challenge already active"),
             Self::ChallengeMissing => f.write_str("no active route challenge"),
             Self::ChallengeTimedOut => f.write_str("route challenge timed out"),
-            Self::UnsupportedVersion => f.write_str("unsupported QL record version"),
             Self::RouteLimit => f.write_str("connection route limit reached"),
             Self::HandshakeOverloaded => f.write_str("handshake capacity exhausted"),
             Self::HandshakeWorkerStopped => f.write_str("handshake worker stopped"),

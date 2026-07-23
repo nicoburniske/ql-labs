@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+bytes = "1"
 dashmap.workspace = true
 getrandom = "0.2"
 hex.workspace = true

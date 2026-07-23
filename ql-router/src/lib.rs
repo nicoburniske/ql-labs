@@ -60,7 +60,7 @@ pub async fn connect_udp_with_max_payload(
     router: &PeerBundle,
     max_payload: usize,
 ) -> io::Result<(Receiver, Sender)> {
-    if !(protocol::MIN_UDP_PAYLOAD..=protocol::MAX_UDP_PAYLOAD).contains(&max_payload) {
+    if max_payload > protocol::MAX_UDP_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid UDP payload limit",
@@ -94,7 +94,7 @@ pub async fn connect_udp_with_max_payload(
     );
     let mut random = [0; 4];
     ql_wire::QlRandom::fill_random_bytes(&SoftwareCrypto, &mut random);
-    let handshake_id = HandshakeId(u32::from_be_bytes(random));
+    let handshake_id = HandshakeId::decode_bytes(random.as_slice()).unwrap();
     let request = ql_wire::encode_record_vec(
         RecordHeader::new(route, RecordType::Handshake),
         &QlHandshakeRecord::Ik1(
@@ -108,22 +108,19 @@ pub async fn connect_udp_with_max_payload(
     let response = protocol::read_frame(&mut tcp)
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "router disconnected"))?;
-    if response.len() < 12 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "truncated transport response",
-        ));
-    }
-    let session_id = u64::from_be_bytes(response[..8].try_into().unwrap());
-    let router_max_payload = u32::from_be_bytes(response[8..12].try_into().unwrap()) as usize;
-    if !(protocol::MIN_UDP_PAYLOAD..=protocol::MAX_UDP_PAYLOAD).contains(&router_max_payload) {
+    let protocol::TransportResponse {
+        session_id,
+        max_udp_payload,
+        header,
+        handshake: response,
+    } = protocol::TransportResponse::decode_bytes(response.as_slice()).map_err(invalid_data)?;
+    let router_max_payload = max_udp_payload as usize;
+    if router_max_payload > protocol::MAX_UDP_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid router UDP payload limit",
         ));
     }
-    let (header, response) =
-        ql_wire::decode_record::<QlHandshakeRecord, _>(&response[12..]).map_err(invalid_data)?;
     let QlHandshakeRecord::Ik2(response) = response else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -144,12 +141,16 @@ pub async fn connect_udp_with_max_payload(
     let tcp_tx = finalized.tx_key;
     let tcp_rx = finalized.rx_key;
 
+    let confirmation_payload = protocol::TransportConfirmation {
+        max_udp_payload: max_payload as u32,
+    }
+    .encode_vec();
     let confirmation = protocol::seal_packet(
         &tcp_tx,
         PacketKind::Confirm,
         session_id,
         0,
-        &(max_payload as u32).to_be_bytes(),
+        &confirmation_payload,
     );
     protocol::write_frame(&mut tcp, &confirmation).await?;
 
@@ -328,36 +329,60 @@ fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Er
 }
 
 pub mod protocol {
-    use std::io;
+    use std::{io, mem::size_of};
 
     use hkdf::Hkdf;
+    use ql_codec::{Decode, Encode};
     use ql_wire::{
-        ENCRYPTED_MESSAGE_AUTH_SIZE, FinalizedHandshake, Nonce, QlAead, RecordHeader, RecordType,
-        SessionKey, SoftwareCrypto,
+        ENCRYPTED_MESSAGE_AUTH_SIZE, FinalizedHandshake, Nonce, QlAead, QlHandshakeRecord,
+        RecordHeader, SessionKey, SoftwareCrypto,
     };
     use sha2::Sha256;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use crate::MAX_RECORD_SIZE;
 
-    pub const PACKET_OVERHEAD: usize = 1 + 8 + 8 + ENCRYPTED_MESSAGE_AUTH_SIZE;
-    pub const MIN_UDP_PAYLOAD: usize = PACKET_OVERHEAD + ql_wire::RecordHeader::WIRE_SIZE;
+    pub const PACKET_OVERHEAD: usize = PACKET_HEADER_SIZE + ENCRYPTED_MESSAGE_AUTH_SIZE;
     pub const MAX_UDP_PAYLOAD: usize = PACKET_OVERHEAD + MAX_RECORD_SIZE;
 
     const FRAME_HEADER_SIZE: usize = 4;
     const MAX_FRAME_SIZE: usize = MAX_RECORD_SIZE + PACKET_OVERHEAD;
     const PACKET_VERSION: u8 = 1;
-    const PACKET_HEADER_SIZE: usize = PACKET_OVERHEAD - ENCRYPTED_MESSAGE_AUTH_SIZE;
+    const PACKET_HEADER_SIZE: usize = size_of::<u8>() + size_of::<u64>() * 2;
     const UDP_KEY_INFO: &[u8] = b"ql-router:transport-keys:v1:udp";
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[repr(u8)]
-    pub enum PacketKind {
-        Confirm = 1,
-        Attach = 2,
-        UdpReady = 3,
-        Bind = 4,
-        Record = 5,
+    ql_codec::codec! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum PacketKind {
+            Confirm = 1,
+            Attach = 2,
+            UdpReady = 3,
+            Bind = 4,
+            Record = 5,
+        }
+    }
+
+    ql_codec::codec! {
+        pub struct PacketHeader {
+            pub version_and_kind: u8,
+            pub session_id: u64,
+            pub number: u64,
+        }
+    }
+
+    ql_codec::codec! {
+        pub struct TransportResponse {
+            pub session_id: u64,
+            pub max_udp_payload: u32,
+            pub header: RecordHeader,
+            pub handshake: QlHandshakeRecord,
+        }
+    }
+
+    ql_codec::codec! {
+        pub struct TransportConfirmation {
+            pub max_udp_payload: u32,
+        }
     }
 
     pub struct Packet<'a> {
@@ -407,9 +432,12 @@ pub mod protocol {
     ) {
         packet.clear();
         packet.reserve(PACKET_OVERHEAD + payload.len());
-        packet.push(PACKET_VERSION << 4 | kind as u8);
-        packet.extend_from_slice(&session_id.to_be_bytes());
-        packet.extend_from_slice(&number.to_be_bytes());
+        PacketHeader {
+            version_and_kind: PACKET_VERSION << 4 | kind as u8,
+            session_id,
+            number,
+        }
+        .encode(packet);
         packet.extend_from_slice(payload);
         let authenticated_len = authenticated_prefix_len(kind, payload);
         let tag = SoftwareCrypto.aes256_gcm_encrypt(
@@ -426,36 +454,30 @@ pub mod protocol {
         expected_session_id: u64,
         packet: &'a [u8],
     ) -> io::Result<Packet<'a>> {
-        if packet.len() < PACKET_OVERHEAD
-            || packet[0] >> 4 != PACKET_VERSION
-            || u64::from_be_bytes(packet[1..9].try_into().unwrap()) != expected_session_id
+        if packet.len() < PACKET_OVERHEAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid authenticated packet header",
+            ));
+        }
+        let header = PacketHeader::decode_bytes(packet).map_err(super::invalid_data)?;
+        if header.version_and_kind >> 4 != PACKET_VERSION
+            || header.session_id != expected_session_id
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid authenticated packet header",
             ));
         }
-        let kind = match packet[0] & 0x0f {
-            1 => PacketKind::Confirm,
-            2 => PacketKind::Attach,
-            3 => PacketKind::UdpReady,
-            4 => PacketKind::Bind,
-            5 => PacketKind::Record,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unsupported authenticated packet kind",
-                ));
-            }
-        };
-        let number = u64::from_be_bytes(packet[9..17].try_into().unwrap());
+        let kind =
+            PacketKind::try_from(header.version_and_kind & 0x0f).map_err(super::invalid_data)?;
         let tag_at = packet.len() - ENCRYPTED_MESSAGE_AUTH_SIZE;
-        let mut tag = [0; ENCRYPTED_MESSAGE_AUTH_SIZE];
-        tag.copy_from_slice(&packet[tag_at..]);
+        let tag = <[u8; ENCRYPTED_MESSAGE_AUTH_SIZE]>::decode_bytes(&packet[tag_at..])
+            .map_err(super::invalid_data)?;
         let authenticated_len = authenticated_prefix_len(kind, &packet[PACKET_HEADER_SIZE..tag_at]);
         if !SoftwareCrypto.aes256_gcm_decrypt(
             key,
-            &Nonce::from_counter(number),
+            &Nonce::from_counter(header.number),
             &packet[..authenticated_len],
             &mut [],
             &tag,
@@ -467,7 +489,7 @@ pub mod protocol {
         }
         Ok(Packet {
             kind,
-            number,
+            number: header.number,
             payload: &packet[PACKET_HEADER_SIZE..tag_at],
         })
     }
@@ -488,12 +510,9 @@ pub mod protocol {
 
     fn authenticated_prefix_len(kind: PacketKind, payload: &[u8]) -> usize {
         PACKET_HEADER_SIZE
-            + if kind == PacketKind::Record
-                && payload.get(RecordHeader::WIRE_SIZE - 1) == Some(&(RecordType::Session as u8))
-            {
-                RecordHeader::WIRE_SIZE
-            } else {
-                payload.len()
+            + match kind {
+                PacketKind::Record => payload.len().min(RecordHeader::WIRE_SIZE),
+                _ => payload.len(),
             }
     }
 
@@ -503,7 +522,7 @@ pub mod protocol {
             return Ok(None);
         }
         reader.read_exact(&mut header[1..]).await?;
-        let length = u32::from_be_bytes(header) as usize;
+        let length = u32::decode_bytes(header.as_slice()).map_err(super::invalid_data)? as usize;
         if length > MAX_FRAME_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -525,7 +544,8 @@ pub mod protocol {
                 "frame exceeds the transport limit",
             ));
         }
-        let header = (payload.len() as u32).to_be_bytes();
+        let mut header = [0; FRAME_HEADER_SIZE];
+        (payload.len() as u32).encode(&mut header.as_mut_slice());
         writer.write_all(&header).await?;
         writer.write_all(payload).await
     }

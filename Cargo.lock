@@ -2203,7 +2203,6 @@ dependencies = [
 [[package]]
 name = "ql-codec"
 version = "0.1.0"
-source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#d8cb46c664cafff08ed24262a2b16065414846a7"
 dependencies = [
  "bytes",
 ]
@@ -2246,7 +2245,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "bytes",
  "dashmap 6.2.1",
+ "getrandom 0.2.17",
  "hex",
  "hkdf",
  "ql-codec",
