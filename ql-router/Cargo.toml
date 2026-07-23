@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-async-channel.workspace = true
 bytes = "1"
 dashmap.workspace = true
 figment.workspace = true

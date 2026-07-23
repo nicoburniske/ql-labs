@@ -8,11 +8,9 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
-    thread,
     time::Duration,
 };
 
-use async_channel::{Sender, TrySendError};
 use dashmap::DashMap;
 use figment::{
     Figment,
@@ -32,14 +30,13 @@ use ql_wire::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{Semaphore, SemaphorePermit, mpsc, oneshot},
+    sync::{Semaphore, SemaphorePermit, mpsc},
     time::{Instant, timeout, timeout_at},
 };
 use tracing::{Instrument, Level, debug, debug_span, info};
 
 const MAX_ROUTES_PER_CONNECTION: usize = 64;
 const OUTBOUND_QUEUE_SIZE: usize = 4;
-const HANDSHAKE_QUEUE_SIZE: usize = 32;
 const MAX_PENDING_HANDSHAKES: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -74,12 +71,19 @@ struct ActiveChallenge {
 
 struct Router {
     identity: QlIdentity,
-    handshakes: HandshakeExecutor,
+    handshake_capacity: Semaphore,
     challenge_capacity: Semaphore,
     connections: DashMap<ConnectionId, Arc<Connection>>,
     routes: DashMap<QID, ConnectionId>,
     udp: UdpSocket,
     udp_max_payload: usize,
+}
+
+impl Router {
+    async fn handshake<T>(&self, work: impl FnOnce() -> T) -> T {
+        let _permit = self.handshake_capacity.acquire().await.unwrap();
+        work()
+    }
 }
 
 struct Connection {
@@ -119,10 +123,6 @@ enum Outbound {
     UdpReady,
 }
 
-struct HandshakeExecutor {
-    tx: Sender<Box<dyn FnOnce() + Send>>,
-}
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let config: Config = Figment::from(Serialized::defaults(Config::default()))
@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
         .map_or(1, |parallelism| (parallelism.get() / 2).clamp(1, 4));
     let router: &'static Router = Box::leak(Box::new(Router {
         identity,
-        handshakes: HandshakeExecutor::new(handshake_workers),
+        handshake_capacity: Semaphore::new(handshake_workers),
         challenge_capacity: Semaphore::new(MAX_PENDING_HANDSHAKES),
         connections: DashMap::new(),
         routes: DashMap::new(),
@@ -166,7 +166,6 @@ async fn main() -> anyhow::Result<()> {
     }));
     info!(
         workers = handshake_workers,
-        queue = HANDSHAKE_QUEUE_SIZE,
         pending = MAX_PENDING_HANDSHAKES,
         routes_per_connection = MAX_ROUTES_PER_CONNECTION,
         udp_max_payload,
@@ -312,8 +311,7 @@ async fn negotiate_transport(
     stream: &mut TcpStream,
 ) -> Result<NegotiatedTransport, Error> {
     let (response, tcp_tx, tcp_rx, udp_keys) = router
-        .handshakes
-        .run(move || {
+        .handshake(|| {
             let (header, request) =
                 ql_wire::decode_record::<QlHandshakeRecord, _>(request.as_slice())?;
             if header.route.recipient != router.identity.qid
@@ -364,16 +362,12 @@ async fn negotiate_transport(
         return Err(Error::Protocol);
     }
 
-    let UdpKeys {
-        tx: udp_tx,
-        rx: udp_rx,
-    } = udp_keys;
     Ok(NegotiatedTransport {
         tcp_tx,
         tcp_rx,
         udp: UdpSession {
-            rx_key: udp_rx,
-            tx_key: udp_tx,
+            rx_key: udp_keys.rx,
+            tx_key: udp_keys.tx,
             egress: Mutex::new(UdpEgress {
                 next_packet: 0,
                 address: None,
@@ -465,9 +459,8 @@ async fn handle_inbound(
                 .challenge_capacity
                 .try_acquire()
                 .map_err(|_| Error::HandshakeOverloaded)?;
-            let (qid, pending, request) = timeout(
-                HANDSHAKE_TIMEOUT,
-                router.handshakes.run(move || {
+            let (qid, pending, request) = router
+                .handshake(|| -> Result<_, Error> {
                     let bundle = PeerBundle::decode_bytes(payload.as_slice())?;
                     bundle.validate(&SoftwareCrypto)?;
                     let qid = bundle.qid;
@@ -478,10 +471,8 @@ async fn handle_inbound(
                         handshake_id,
                     )?;
                     Ok((qid, pending, request))
-                }),
-            )
-            .await
-            .map_err(|_| Error::ChallengeTimedOut)??;
+                })
+                .await?;
             outbound
                 .send(Outbound::Record(request))
                 .await
@@ -507,14 +498,9 @@ async fn handle_inbound(
         let challenge = inbound.challenge.take().ok_or(Error::ChallengeMissing)?;
         let pending = challenge.pending;
         let _admission = challenge._admission;
-        let (qid, accepted) = timeout(
-            HANDSHAKE_TIMEOUT,
-            router
-                .handshakes
-                .run(move || Ok(pending.verify(&SoftwareCrypto, &record)?)),
-        )
-        .await
-        .map_err(|_| Error::ChallengeTimedOut)??;
+        let (qid, accepted) = router
+            .handshake(|| pending.verify(&SoftwareCrypto, &record))
+            .await?;
         inbound.routes.insert(qid);
         router.routes.insert(qid, connection);
         outbound
@@ -605,40 +591,6 @@ fn route_record<'a>(
     Ok(())
 }
 
-impl HandshakeExecutor {
-    fn new(workers: usize) -> Self {
-        let (tx, rx) = async_channel::bounded::<Box<dyn FnOnce() + Send>>(HANDSHAKE_QUEUE_SIZE);
-        for _ in 0..workers {
-            let rx = rx.clone();
-            thread::spawn(move || {
-                while let Ok(job) = rx.recv_blocking() {
-                    job();
-                }
-            });
-        }
-        Self { tx }
-    }
-
-    async fn run<T>(
-        &self,
-        work: impl FnOnce() -> Result<T, Error> + Send + 'static,
-    ) -> Result<T, Error>
-    where
-        T: Send + 'static,
-    {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.tx
-            .try_send(Box::new(move || {
-                let _ = result_tx.send(work());
-            }))
-            .map_err(|error| match error {
-                TrySendError::Full(_) => Error::HandshakeOverloaded,
-                TrySendError::Closed(_) => Error::HandshakeWorkerStopped,
-            })?;
-        result_rx.await.map_err(|_| Error::HandshakeWorkerStopped)?
-    }
-}
-
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Error {
@@ -652,7 +604,6 @@ enum Error {
     HandshakeTimedOut,
     RouteLimit,
     HandshakeOverloaded,
-    HandshakeWorkerStopped,
     WriterStopped,
     Protocol,
 }
@@ -688,7 +639,6 @@ impl fmt::Display for Error {
             Self::HandshakeTimedOut => f.write_str("transport handshake timed out"),
             Self::RouteLimit => f.write_str("connection route limit reached"),
             Self::HandshakeOverloaded => f.write_str("handshake capacity exhausted"),
-            Self::HandshakeWorkerStopped => f.write_str("handshake worker stopped"),
             Self::WriterStopped => f.write_str("connection writer stopped"),
             Self::Protocol => f.write_str("transport protocol error"),
         }
