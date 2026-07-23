@@ -38,10 +38,10 @@ use tokio::{
 use tracing::{Instrument, Level, debug, debug_span, info};
 
 const MAX_ROUTES_PER_CONNECTION: usize = 64;
-const OUTBOUND_QUEUE_SIZE: usize = 16;
+const OUTBOUND_QUEUE_SIZE: usize = 4;
 const HANDSHAKE_QUEUE_SIZE: usize = 32;
 const MAX_PENDING_HANDSHAKES: usize = 1024;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type ConnectionId = u64;
 
@@ -212,14 +212,18 @@ async fn serve(
     connection: ConnectionId,
     mut stream: TcpStream,
 ) -> Result<(), Error> {
-    let request = protocol::read_frame(&mut stream)
-        .await?
-        .ok_or(Error::Protocol)?;
     let NegotiatedTransport {
         tcp_tx,
         tcp_rx,
         udp,
-    } = negotiate_transport(router, connection, request, &mut stream).await?;
+    } = timeout(HANDSHAKE_TIMEOUT, async {
+        let request = protocol::read_frame(&mut stream)
+            .await?
+            .ok_or(Error::Protocol)?;
+        negotiate_transport(router, connection, request, &mut stream).await
+    })
+    .await
+    .map_err(|_| Error::HandshakeTimedOut)??;
     let (mut reader, mut writer) = stream.into_split();
     let (outbound, mut outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_SIZE);
 
@@ -307,9 +311,9 @@ async fn negotiate_transport(
     request: Vec<u8>,
     stream: &mut TcpStream,
 ) -> Result<NegotiatedTransport, Error> {
-    let (response, tcp_tx, tcp_rx, udp_keys) = timeout(
-        HANDSHAKE_TIMEOUT,
-        router.handshakes.run(move || {
+    let (response, tcp_tx, tcp_rx, udp_keys) = router
+        .handshakes
+        .run(move || {
             let (header, request) =
                 ql_wire::decode_record::<QlHandshakeRecord, _>(request.as_slice())?;
             if header.route.recipient != router.identity.qid
@@ -343,18 +347,13 @@ async fn negotiate_transport(
             let finalized = handshake.finalize(&SoftwareCrypto)?;
             let udp_keys = protocol::derive_udp_keys(&finalized);
             Ok((response, finalized.tx_key, finalized.rx_key, udp_keys))
-        }),
-    )
-    .await
-    .map_err(|_| Error::ChallengeTimedOut)??;
+        })
+        .await?;
 
     let session_id = response.session_id;
     protocol::write_frame(stream, &response.encode_vec()).await?;
 
-    let confirmation = timeout(HANDSHAKE_TIMEOUT, protocol::read_frame(stream))
-        .await
-        .map_err(|_| Error::ChallengeTimedOut)??
-        .ok_or(Error::Protocol)?;
+    let confirmation = protocol::read_frame(stream).await?.ok_or(Error::Protocol)?;
     let confirmation = protocol::open_packet(&tcp_rx, session_id, &confirmation)?;
     if confirmation.kind != PacketKind::Confirm || confirmation.number != 0 {
         return Err(Error::Protocol);
@@ -650,6 +649,7 @@ enum Error {
     ChallengeActive,
     ChallengeMissing,
     ChallengeTimedOut,
+    HandshakeTimedOut,
     RouteLimit,
     HandshakeOverloaded,
     HandshakeWorkerStopped,
@@ -685,6 +685,7 @@ impl fmt::Display for Error {
             Self::ChallengeActive => f.write_str("route challenge already active"),
             Self::ChallengeMissing => f.write_str("no active route challenge"),
             Self::ChallengeTimedOut => f.write_str("route challenge timed out"),
+            Self::HandshakeTimedOut => f.write_str("transport handshake timed out"),
             Self::RouteLimit => f.write_str("connection route limit reached"),
             Self::HandshakeOverloaded => f.write_str("handshake capacity exhausted"),
             Self::HandshakeWorkerStopped => f.write_str("handshake worker stopped"),
