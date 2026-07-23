@@ -93,6 +93,16 @@ async fn authenticated_udp_routes_only_attached_senders() {
         Some(small)
     );
 
+    let small = record(bob.qid, alice.qid, 32);
+    send(&mut bob_tx, &small).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), receive(&mut alice_rx))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(small)
+    );
+
     let oversized = record(bob.qid, alice.qid, 1400);
     send(&mut bob_tx, &oversized).await.unwrap();
     assert_eq!(

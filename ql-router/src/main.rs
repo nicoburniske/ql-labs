@@ -7,7 +7,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -20,7 +20,7 @@ use ql_codec::{Decode, Encode};
 use ql_common::QID;
 use ql_router::{
     DEFAULT_ADDRESS, DEFAULT_UDP_PAYLOAD, MAX_RECORD_SIZE,
-    protocol::{self, PacketKind, UdpKeys},
+    protocol::{self, PacketKind},
 };
 use ql_wire::{
     HandshakeId, IkHandshake, PeerBundle, PeerChallenge, QlHandshakeRecord, QlIdentity,
@@ -87,20 +87,20 @@ impl Router {
 }
 
 struct Connection {
-    outbound: mpsc::Sender<Outbound>,
+    outbound: mpsc::Sender<Vec<u8>>,
     udp: UdpSession,
 }
 
 struct UdpSession {
     rx_key: SessionKey,
     tx_key: SessionKey,
-    egress: Mutex<UdpEgress>,
+    address: OnceLock<SocketAddr>,
+    sender: Mutex<UdpSender>,
     peer_max_payload: usize,
 }
 
-struct UdpEgress {
+struct UdpSender {
     next_packet: u64,
-    address: Option<SocketAddr>,
     packet: Vec<u8>,
 }
 
@@ -116,11 +116,6 @@ struct NegotiatedTransport {
     tcp_tx: SessionKey,
     tcp_rx: SessionKey,
     udp: UdpSession,
-}
-
-enum Outbound {
-    Record(Vec<u8>),
-    UdpReady,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -242,24 +237,14 @@ async fn serve(
                 let Some(number) = protocol::next_packet_number(&mut packet_number) else {
                     break;
                 };
-                match message {
-                    Outbound::Record(record) => protocol::seal_packet_into(
-                        &mut packet,
-                        &tcp_tx,
-                        PacketKind::Record,
-                        connection,
-                        number,
-                        &record,
-                    ),
-                    Outbound::UdpReady => protocol::seal_packet_into(
-                        &mut packet,
-                        &tcp_tx,
-                        PacketKind::UdpReady,
-                        connection,
-                        number,
-                        &[],
-                    ),
-                }
+                protocol::seal_packet_into(
+                    &mut packet,
+                    &tcp_tx,
+                    PacketKind::Record,
+                    connection,
+                    number,
+                    &message,
+                );
                 if let Err(error) = protocol::write_frame(&mut writer, &packet).await {
                     debug!(%error, "connection write failed");
                     break;
@@ -368,9 +353,9 @@ async fn negotiate_transport(
         udp: UdpSession {
             rx_key: udp_keys.rx,
             tx_key: udp_keys.tx,
-            egress: Mutex::new(UdpEgress {
+            address: OnceLock::new(),
+            sender: Mutex::new(UdpSender {
                 next_packet: 0,
-                address: None,
                 packet: Vec::with_capacity(peer_max_payload),
             }),
             peer_max_payload,
@@ -398,33 +383,29 @@ async fn serve_udp(router: &Router) -> io::Result<()> {
             continue;
         };
         let session = &connection.udp;
-        let bound_address = session.egress.lock().unwrap().address;
-        if bound_address.is_some_and(|address| address != source) {
+        let bound = session.address.get();
+        if bound.is_some_and(|address| *address != source) {
             continue;
         }
         let Ok(packet) = protocol::open_packet(&session.rx_key, session_id, packet) else {
             continue;
         };
-        match packet.kind {
-            PacketKind::Bind if packet.payload.is_empty() => {
-                session.egress.lock().unwrap().address = Some(source);
-                let _ = connection.outbound.try_send(Outbound::UdpReady);
+        if packet.kind == PacketKind::Record {
+            if packet.payload.len() > MAX_RECORD_SIZE {
+                continue;
             }
-            PacketKind::Record => {
-                if bound_address.is_none() || packet.payload.len() > MAX_RECORD_SIZE {
-                    continue;
-                }
-                let Ok(header) = RecordHeader::decode_bytes(packet.payload) else {
-                    continue;
-                };
-                if header.record_type != RecordType::Session
-                    || header.route.recipient == router.identity.qid
-                {
-                    continue;
-                }
-                let _ = route_record(router, Cow::Borrowed(packet.payload), header, session_id);
+            let Ok(header) = RecordHeader::decode_bytes(packet.payload) else {
+                continue;
+            };
+            if header.record_type != RecordType::Session
+                || header.route.recipient == router.identity.qid
+            {
+                continue;
             }
-            _ => {}
+            if bound.is_none() {
+                session.address.set(source).unwrap();
+            }
+            let _ = route_record(router, Cow::Borrowed(packet.payload), header, session_id);
         }
     }
 }
@@ -433,7 +414,7 @@ async fn handle_inbound(
     router: &'static Router,
     packet: Vec<u8>,
     connection: ConnectionId,
-    outbound: &mpsc::Sender<Outbound>,
+    outbound: &mpsc::Sender<Vec<u8>>,
     inbound: &mut Inbound,
 ) -> Result<(), Error> {
     let (kind, number, payload) =
@@ -474,7 +455,7 @@ async fn handle_inbound(
                 })
                 .await?;
             outbound
-                .send(Outbound::Record(request))
+                .send(request)
                 .await
                 .map_err(|_| Error::WriterStopped)?;
             inbound.challenge = Some(ActiveChallenge {
@@ -504,7 +485,7 @@ async fn handle_inbound(
         inbound.routes.insert(qid);
         router.routes.insert(qid, connection);
         outbound
-            .send(Outbound::Record(accepted))
+            .send(accepted)
             .await
             .map_err(|_| Error::WriterStopped)?;
         info!(connection, qid = %hex::encode(qid.0), "authenticated QID");
@@ -556,33 +537,25 @@ fn route_record<'a>(
         && record.len() + protocol::PACKET_OVERHEAD <= egress.udp.peer_max_payload
     {
         let udp = &egress.udp;
-        let mut udp_egress = udp.egress.lock().unwrap();
-        if let Some(address) = udp_egress.address {
-            let Some(number) = protocol::next_packet_number(&mut udp_egress.next_packet) else {
-                udp_egress.address = None;
+        if let Some(&address) = udp.address.get() {
+            let mut sender = udp.sender.lock().unwrap();
+            let Some(number) = protocol::next_packet_number(&mut sender.next_packet) else {
                 return Ok(());
             };
             protocol::seal_packet_into(
-                &mut udp_egress.packet,
+                &mut sender.packet,
                 &udp.tx_key,
                 PacketKind::Record,
                 egress_id,
                 number,
                 record.as_ref(),
             );
-            if let Err(error) = router.udp.try_send_to(&udp_egress.packet, address)
-                && error.kind() != io::ErrorKind::WouldBlock
-            {
-                udp_egress.address = None;
-            }
+            let _ = router.udp.try_send_to(&sender.packet, address);
             return Ok(());
         }
     }
 
-    if let Err(mpsc::error::TrySendError::Full(_)) = egress
-        .outbound
-        .try_send(Outbound::Record(record.into_owned()))
-    {
+    if let Err(mpsc::error::TrySendError::Full(_)) = egress.outbound.try_send(record.into_owned()) {
         debug!(
             connection = egress_id,
             "outbound queue full; dropping record"

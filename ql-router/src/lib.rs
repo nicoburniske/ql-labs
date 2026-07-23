@@ -1,19 +1,17 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{io, sync::Arc};
 
 use ql_codec::{Decode, Encode};
 use ql_wire::{
     HandshakeId, IkHandshake, PeerBundle, QlHandshakeRecord, RecordHeader, RecordType, RouteHeader,
     SessionKey, SoftwareCrypto, TransportParams, generate_identity,
 };
-use tokio::{
-    net::{TcpStream, ToSocketAddrs, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
-    time::{Instant, timeout},
-};
+use tokio::net::{TcpStream, ToSocketAddrs, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 
 use crate::protocol::PacketKind;
 
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1:7447";
 pub const DEFAULT_UDP_PAYLOAD: usize = 1200;
+pub const DEFAULT_UDP_RECORD_SIZE: usize = DEFAULT_UDP_PAYLOAD - protocol::PACKET_OVERHEAD;
 pub const MAX_RECORD_SIZE: usize = 8 * 1024;
 
 pub struct Receiver {
@@ -44,7 +42,6 @@ struct UdpSender {
     key: SessionKey,
     next_packet: u64,
     max_payload: usize,
-    active: bool,
     buffer: Vec<u8>,
 }
 
@@ -154,57 +151,6 @@ pub async fn connect_udp_with_max_payload(
     );
     protocol::write_frame(&mut tcp, &confirmation).await?;
 
-    let mut udp_packet: u64 = 0;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let packet_number = protocol::next_packet_number(&mut udp_packet)
-            .ok_or_else(|| io::Error::other("UDP packet number exhausted during activation"))?;
-        let bind = protocol::seal_packet(
-            &udp_keys.tx,
-            PacketKind::Bind,
-            session_id,
-            packet_number,
-            &[],
-        );
-        udp.send(&bind).await?;
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "UDP activation timed out",
-            ));
-        }
-        match timeout(
-            remaining.min(Duration::from_millis(250)),
-            protocol::read_frame(&mut tcp),
-        )
-        .await
-        {
-            Ok(Ok(Some(packet))) => {
-                let packet = protocol::open_packet(&tcp_rx, session_id, &packet)?;
-                if packet.kind == PacketKind::UdpReady
-                    && packet.payload.is_empty()
-                    && packet.number == 0
-                {
-                    break;
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unexpected packet during UDP activation",
-                ));
-            }
-            Ok(Ok(None)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "router disconnected during UDP activation",
-                ));
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {}
-        }
-    }
-
     let (tcp, writer) = tcp.into_split();
     Ok((
         Receiver {
@@ -216,7 +162,7 @@ pub async fn connect_udp_with_max_payload(
                 buffer: vec![0; max_payload],
             },
             tcp_key: tcp_rx,
-            next_tcp_packet: 1,
+            next_tcp_packet: 0,
         },
         Sender {
             tcp: writer,
@@ -224,9 +170,8 @@ pub async fn connect_udp_with_max_payload(
                 socket: udp,
                 session_id,
                 key: udp_keys.tx,
-                next_packet: udp_packet,
+                next_packet: 0,
                 max_payload: router_max_payload,
-                active: true,
                 buffer: Vec::with_capacity(router_max_payload),
             },
             tcp_key: tcp_tx,
@@ -254,7 +199,6 @@ pub async fn receive(receiver: &mut Receiver) -> io::Result<Option<Vec<u8>>> {
                 }
                 match kind {
                     PacketKind::Record => return Ok(Some(payload)),
-                    PacketKind::UdpReady if payload.is_empty() => continue,
                     _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected router packet")),
                 }
             }
@@ -273,8 +217,7 @@ pub async fn receive(receiver: &mut Receiver) -> io::Result<Option<Vec<u8>>> {
 
 pub async fn send(sender: &mut Sender, record: &[u8]) -> io::Result<()> {
     let udp = &mut sender.udp;
-    if udp.active
-        && record.len() + protocol::PACKET_OVERHEAD <= udp.max_payload
+    if record.len() + protocol::PACKET_OVERHEAD <= udp.max_payload
         && RecordHeader::decode_bytes(record)
             .is_ok_and(|header| header.record_type == RecordType::Session)
     {
@@ -287,16 +230,10 @@ pub async fn send(sender: &mut Sender, record: &[u8]) -> io::Result<()> {
                 number,
                 record,
             );
-            match udp.socket.try_send(&udp.buffer) {
-                Ok(_) => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(_) => {
-                    udp.active = false;
-                    return Ok(());
-                }
-            }
+            let _ = udp.socket.try_send(&udp.buffer);
+            return Ok(());
         }
-        udp.active = false;
+        return Ok(());
     }
     send_tcp_packet(sender, PacketKind::Record, record).await
 }
@@ -352,9 +289,7 @@ pub mod protocol {
         pub enum PacketKind {
             Confirm = 1,
             Attach = 2,
-            UdpReady = 3,
-            Bind = 4,
-            Record = 5,
+            Record = 3,
         }
     }
 

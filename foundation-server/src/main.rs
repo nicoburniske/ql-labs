@@ -10,7 +10,7 @@ use figment::{
 };
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
-use ql_router::{DEFAULT_ADDRESS, attach, connect_udp, receive, send};
+use ql_router::{DEFAULT_ADDRESS, DEFAULT_UDP_RECORD_SIZE, attach, connect_udp, receive, send};
 use ql_runtime::{RuntimeConfig, RuntimeHandle, new_runtime};
 use ql_wire::{
     PeerBundle, QlHandshakeRecord, QlIdentity, RecordHeader, RecordType, SoftwareCrypto,
@@ -143,7 +143,9 @@ async fn handle_inbound(
 
     let (inbound, inbound_rx) = mpsc::channel(64);
     let platform = Platform::new(sender, outbound.clone(), inbound_rx, peers.clone());
-    let (runtime, handle) = new_runtime(identity.clone(), platform, RuntimeConfig::default());
+    let mut config = RuntimeConfig::default();
+    config.fsm.session_record_max_size = DEFAULT_UDP_RECORD_SIZE;
+    let (runtime, handle) = new_runtime(identity.clone(), platform, config);
     inbound.send(record).await.expect("new runtime is alive");
     peers.insert(
         sender,
