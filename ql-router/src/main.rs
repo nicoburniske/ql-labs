@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
     let identity = Arc::new(identity);
     let handshake_workers = std::thread::available_parallelism()
         .map_or(1, |parallelism| (parallelism.get() / 2).clamp(1, 4));
-    let router = Arc::new(Router {
+    let router: &'static Router = Box::leak(Box::new(Router {
         identity,
         handshakes: HandshakeExecutor::new(handshake_workers),
         challenge_capacity: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
         routes: DashMap::new(),
         udp,
         udp_max_payload,
-    });
+    }));
     info!(
         workers = handshake_workers,
         queue = HANDSHAKE_QUEUE_SIZE,
@@ -183,10 +183,9 @@ async fn main() -> Result<()> {
     run(listener, router).await
 }
 
-async fn run(listener: TcpListener, router: Arc<Router>) -> Result<()> {
-    let udp_router = router.clone();
+async fn run(listener: TcpListener, router: &'static Router) -> Result<()> {
     tokio::spawn(async move {
-        if let Err(error) = serve_udp(&udp_router).await {
+        if let Err(error) = serve_udp(router).await {
             tracing::error!(%error, "UDP listener stopped");
         }
     });
@@ -201,11 +200,10 @@ async fn run(listener: TcpListener, router: Arc<Router>) -> Result<()> {
                 break connection;
             }
         };
-        let router = router.clone();
         tokio::spawn(
             async move {
                 debug!("connection opened");
-                if let Err(error) = serve(connection, stream, &router).await {
+                if let Err(error) = serve(connection, stream, router).await {
                     debug!(%error, "connection failed");
                 }
                 debug!("connection closed");
