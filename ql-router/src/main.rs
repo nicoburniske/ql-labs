@@ -27,7 +27,7 @@ use ql_wire::{
 };
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{Semaphore, SemaphorePermit, mpsc, oneshot},
     time::{Instant, timeout, timeout_at},
 };
 use tracing::{Instrument, Level, debug, debug_span, info};
@@ -39,37 +39,17 @@ const MAX_PENDING_HANDSHAKES: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type ConnectionId = u64;
-type PendingChallenge = PeerChallenge<Arc<QlIdentity>>;
-type ConnectionResult<T> = std::result::Result<T, ConnectionError>;
-type HandshakeJob = Box<dyn FnOnce() + Send>;
-
-#[repr(usize)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectionError {
-    Io,
-    Codec,
-    Wire,
-    AttachRequired,
-    ChallengeActive,
-    ChallengeMissing,
-    ChallengeTimedOut,
-    RouteLimit,
-    HandshakeOverloaded,
-    HandshakeWorkerStopped,
-    WriterStopped,
-    Protocol,
-}
 
 struct ActiveChallenge {
-    pending: PendingChallenge,
+    pending: PeerChallenge<&'static QlIdentity>,
     deadline: Instant,
-    _admission: OwnedSemaphorePermit,
+    _admission: SemaphorePermit<'static>,
 }
 
 struct Router {
-    identity: Arc<QlIdentity>,
+    identity: QlIdentity,
     handshakes: HandshakeExecutor,
-    challenge_capacity: Arc<Semaphore>,
+    challenge_capacity: Semaphore,
     connections: DashMap<ConnectionId, Arc<Connection>>,
     routes: DashMap<QID, ConnectionId>,
     udp: UdpSocket,
@@ -114,7 +94,7 @@ enum Outbound {
 }
 
 struct HandshakeExecutor {
-    tx: Sender<HandshakeJob>,
+    tx: Sender<Box<dyn FnOnce() + Send>>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -158,13 +138,12 @@ async fn main() -> Result<()> {
     info!(qid = %hex::encode(identity.qid.0), "QL router identity ready");
     info!(path = %bundle_path, "QL router peer bundle ready");
 
-    let identity = Arc::new(identity);
     let handshake_workers = std::thread::available_parallelism()
         .map_or(1, |parallelism| (parallelism.get() / 2).clamp(1, 4));
     let router: &'static Router = Box::leak(Box::new(Router {
         identity,
         handshakes: HandshakeExecutor::new(handshake_workers),
-        challenge_capacity: Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES)),
+        challenge_capacity: Semaphore::new(MAX_PENDING_HANDSHAKES),
         connections: DashMap::new(),
         routes: DashMap::new(),
         udp,
@@ -180,10 +159,10 @@ async fn main() -> Result<()> {
     );
     info!(address = %listener.local_addr()?, "QL router listening on");
 
-    run(listener, router).await
+    run(router, listener).await
 }
 
-async fn run(listener: TcpListener, router: &'static Router) -> Result<()> {
+async fn run(router: &'static Router, listener: TcpListener) -> Result<()> {
     tokio::spawn(async move {
         if let Err(error) = serve_udp(router).await {
             tracing::error!(%error, "UDP listener stopped");
@@ -203,7 +182,7 @@ async fn run(listener: TcpListener, router: &'static Router) -> Result<()> {
         tokio::spawn(
             async move {
                 debug!("connection opened");
-                if let Err(error) = serve(connection, stream, router).await {
+                if let Err(error) = serve(router, connection, stream).await {
                     debug!(%error, "connection failed");
                 }
                 debug!("connection closed");
@@ -214,18 +193,18 @@ async fn run(listener: TcpListener, router: &'static Router) -> Result<()> {
 }
 
 async fn serve(
+    router: &'static Router,
     connection: ConnectionId,
     mut stream: TcpStream,
-    router: &Router,
-) -> ConnectionResult<()> {
+) -> Result<(), Error> {
     let request = protocol::read_frame(&mut stream)
         .await?
-        .ok_or(ConnectionError::Protocol)?;
+        .ok_or(Error::Protocol)?;
     let NegotiatedTransport {
         tcp_tx,
         tcp_rx,
         udp,
-    } = negotiate_transport(connection, request, &mut stream, router).await?;
+    } = negotiate_transport(router, connection, request, &mut stream).await?;
     let (mut reader, mut writer) = stream.into_split();
     let (outbound, mut outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_SIZE);
 
@@ -242,7 +221,7 @@ async fn serve(
             let mut packet_number: u64 = 0;
             let mut packet = Vec::new();
             while let Some(message) = outbound_rx.recv().await {
-                let Some(next_packet) = packet_number.checked_add(1) else {
+                let Some(number) = protocol::next_packet_number(&mut packet_number) else {
                     break;
                 };
                 match message {
@@ -251,7 +230,7 @@ async fn serve(
                         &tcp_tx,
                         PacketKind::Record,
                         connection,
-                        packet_number,
+                        number,
                         &record,
                     ),
                     Outbound::UdpReady => protocol::seal_packet_into(
@@ -259,11 +238,10 @@ async fn serve(
                         &tcp_tx,
                         PacketKind::UdpReady,
                         connection,
-                        packet_number,
+                        number,
                         &[],
                     ),
                 }
-                packet_number = next_packet;
                 if let Err(error) = protocol::write_frame(&mut writer, &packet).await {
                     debug!(%error, "connection write failed");
                     break;
@@ -285,12 +263,12 @@ async fn serve(
             let packet = if let Some(challenge) = inbound.challenge.as_ref() {
                 timeout_at(challenge.deadline, protocol::read_frame(&mut reader))
                     .await
-                    .map_err(|_| ConnectionError::ChallengeTimedOut)??
+                    .map_err(|_| Error::ChallengeTimedOut)??
             } else {
                 protocol::read_frame(&mut reader).await?
             };
             let Some(packet) = packet else { break };
-            handle_inbound(packet, connection, router, &outbound, &mut inbound).await?;
+            handle_inbound(router, packet, connection, &outbound, &mut inbound).await?;
         }
         Ok(())
     }
@@ -309,28 +287,27 @@ async fn serve(
 }
 
 async fn negotiate_transport(
+    router: &'static Router,
     connection: ConnectionId,
     request: Vec<u8>,
     stream: &mut TcpStream,
-    router: &Router,
-) -> ConnectionResult<NegotiatedTransport> {
-    let identity = router.identity.clone();
-    let max_udp_payload = router.udp_max_payload;
+) -> Result<NegotiatedTransport, Error> {
     let (response, tcp_tx, tcp_rx, udp_keys) = timeout(
         HANDSHAKE_TIMEOUT,
         router.handshakes.run(move || {
             let (header, request) =
                 ql_wire::decode_record::<QlHandshakeRecord, _>(request.as_slice())?;
-            if header.route.recipient != identity.qid || header.record_type != RecordType::Handshake
+            if header.route.recipient != router.identity.qid
+                || header.record_type != RecordType::Handshake
             {
-                return Err(ConnectionError::Protocol);
+                return Err(Error::Protocol);
             }
             let QlHandshakeRecord::Ik1(request) = request else {
-                return Err(ConnectionError::Protocol);
+                return Err(Error::Protocol);
             };
             let mut handshake = IkHandshake::new_ik_responder(
                 &SoftwareCrypto,
-                identity.clone(),
+                &router.identity,
                 None,
                 TransportParams::default(),
             );
@@ -338,7 +315,7 @@ async fn negotiate_transport(
             let response = handshake.write_2(&SoftwareCrypto, request.handshake_id)?;
             let response = protocol::TransportResponse {
                 session_id: connection,
-                max_udp_payload: max_udp_payload as u32,
+                max_udp_payload: router.udp_max_payload as u32,
                 header: RecordHeader::new(
                     RouteHeader {
                         sender: header.route.recipient,
@@ -354,23 +331,23 @@ async fn negotiate_transport(
         }),
     )
     .await
-    .map_err(|_| ConnectionError::ChallengeTimedOut)??;
+    .map_err(|_| Error::ChallengeTimedOut)??;
 
     let session_id = response.session_id;
     protocol::write_frame(stream, &response.encode_vec()).await?;
 
     let confirmation = timeout(HANDSHAKE_TIMEOUT, protocol::read_frame(stream))
         .await
-        .map_err(|_| ConnectionError::ChallengeTimedOut)??
-        .ok_or(ConnectionError::Protocol)?;
+        .map_err(|_| Error::ChallengeTimedOut)??
+        .ok_or(Error::Protocol)?;
     let confirmation = protocol::open_packet(&tcp_rx, session_id, &confirmation)?;
     if confirmation.kind != PacketKind::Confirm || confirmation.number != 0 {
-        return Err(ConnectionError::Protocol);
+        return Err(Error::Protocol);
     }
     let peer_max_payload = protocol::TransportConfirmation::decode_bytes(confirmation.payload)?
         .max_udp_payload as usize;
     if peer_max_payload > protocol::MAX_UDP_PAYLOAD {
-        return Err(ConnectionError::Protocol);
+        return Err(Error::Protocol);
     }
 
     let UdpKeys {
@@ -437,7 +414,7 @@ async fn serve_udp(router: &Router) -> io::Result<()> {
                 {
                     continue;
                 }
-                let _ = route_record(Cow::Borrowed(packet.payload), header, session_id, router);
+                let _ = route_record(router, Cow::Borrowed(packet.payload), header, session_id);
             }
             _ => {}
         }
@@ -445,60 +422,56 @@ async fn serve_udp(router: &Router) -> io::Result<()> {
 }
 
 async fn handle_inbound(
+    router: &'static Router,
     packet: Vec<u8>,
     connection: ConnectionId,
-    router: &Router,
     outbound: &mpsc::Sender<Outbound>,
     inbound: &mut Inbound,
-) -> ConnectionResult<()> {
+) -> Result<(), Error> {
     let (kind, number, payload) =
         protocol::open_packet_owned(&inbound.tcp_key, connection, packet)?;
-    let next_packet = inbound
-        .next_tcp_packet
-        .checked_add(1)
-        .ok_or(ConnectionError::Protocol)?;
-    if number != inbound.next_tcp_packet {
-        return Err(ConnectionError::Protocol);
+    if protocol::next_packet_number(&mut inbound.next_tcp_packet) != Some(number) {
+        return Err(Error::Protocol);
     }
-    inbound.next_tcp_packet = next_packet;
 
     let record = match kind {
         PacketKind::Attach => {
             if inbound.challenge.is_some() {
-                return Err(ConnectionError::ChallengeActive);
+                return Err(Error::ChallengeActive);
             }
             if inbound.routes.len() == MAX_ROUTES_PER_CONNECTION {
-                return Err(ConnectionError::RouteLimit);
+                return Err(Error::RouteLimit);
             }
             let handshake_id = HandshakeId(inbound.next_handshake_id);
             inbound.next_handshake_id = inbound
                 .next_handshake_id
                 .checked_add(1)
-                .ok_or(ConnectionError::Protocol)?;
+                .ok_or(Error::Protocol)?;
             let admission = router
                 .challenge_capacity
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| ConnectionError::HandshakeOverloaded)?;
-            let identity = router.identity.clone();
-            let bundle = payload;
+                .try_acquire()
+                .map_err(|_| Error::HandshakeOverloaded)?;
             let (qid, pending, request) = timeout(
                 HANDSHAKE_TIMEOUT,
                 router.handshakes.run(move || {
-                    let bundle = PeerBundle::decode_bytes(bundle.as_slice())?;
+                    let bundle = PeerBundle::decode_bytes(payload.as_slice())?;
                     bundle.validate(&SoftwareCrypto)?;
                     let qid = bundle.qid;
-                    let (pending, request) =
-                        PeerChallenge::new(&SoftwareCrypto, identity, bundle, handshake_id)?;
+                    let (pending, request) = PeerChallenge::new(
+                        &SoftwareCrypto,
+                        &router.identity,
+                        bundle,
+                        handshake_id,
+                    )?;
                     Ok((qid, pending, request))
                 }),
             )
             .await
-            .map_err(|_| ConnectionError::ChallengeTimedOut)??;
+            .map_err(|_| Error::ChallengeTimedOut)??;
             outbound
                 .send(Outbound::Record(request))
                 .await
-                .map_err(|_| ConnectionError::WriterStopped)?;
+                .map_err(|_| Error::WriterStopped)?;
             inbound.challenge = Some(ActiveChallenge {
                 pending,
                 deadline: Instant::now() + HANDSHAKE_TIMEOUT,
@@ -509,18 +482,15 @@ async fn handle_inbound(
         }
         PacketKind::Record => {
             if inbound.routes.is_empty() && inbound.challenge.is_none() {
-                return Err(ConnectionError::AttachRequired);
+                return Err(Error::AttachRequired);
             }
             payload
         }
-        _ => return Err(ConnectionError::Protocol),
+        _ => return Err(Error::Protocol),
     };
     let header = RecordHeader::decode_bytes(record.as_slice())?;
     if header.route.recipient == router.identity.qid {
-        let challenge = inbound
-            .challenge
-            .take()
-            .ok_or(ConnectionError::ChallengeMissing)?;
+        let challenge = inbound.challenge.take().ok_or(Error::ChallengeMissing)?;
         let pending = challenge.pending;
         let _admission = challenge._admission;
         let (qid, accepted) = timeout(
@@ -530,26 +500,26 @@ async fn handle_inbound(
                 .run(move || Ok(pending.verify(&SoftwareCrypto, &record)?)),
         )
         .await
-        .map_err(|_| ConnectionError::ChallengeTimedOut)??;
+        .map_err(|_| Error::ChallengeTimedOut)??;
         inbound.routes.insert(qid);
         router.routes.insert(qid, connection);
         outbound
             .send(Outbound::Record(accepted))
             .await
-            .map_err(|_| ConnectionError::WriterStopped)?;
+            .map_err(|_| Error::WriterStopped)?;
         info!(connection, qid = %hex::encode(qid.0), "authenticated QID");
         return Ok(());
     }
 
-    route_record(Cow::Owned(record), header, connection, router)
+    route_record(router, Cow::Owned(record), header, connection)
 }
 
 fn route_record<'a>(
+    router: &Router,
     record: Cow<'a, [u8]>,
     header: RecordHeader,
     ingress: ConnectionId,
-    router: &Router,
-) -> ConnectionResult<()> {
+) -> Result<(), Error> {
     if router
         .routes
         .get(&header.route.sender)
@@ -588,12 +558,10 @@ fn route_record<'a>(
         let udp = &egress.udp;
         let mut udp_egress = udp.egress.lock().unwrap();
         if let Some(address) = udp_egress.address {
-            let Some(next_packet) = udp_egress.next_packet.checked_add(1) else {
+            let Some(number) = protocol::next_packet_number(&mut udp_egress.next_packet) else {
                 udp_egress.address = None;
                 return Ok(());
             };
-            let number = udp_egress.next_packet;
-            udp_egress.next_packet = next_packet;
             protocol::seal_packet_into(
                 &mut udp_egress.packet,
                 &udp.tx_key,
@@ -625,7 +593,7 @@ fn route_record<'a>(
 
 impl HandshakeExecutor {
     fn new(workers: usize) -> Self {
-        let (tx, rx) = async_channel::bounded::<HandshakeJob>(HANDSHAKE_QUEUE_SIZE);
+        let (tx, rx) = async_channel::bounded::<Box<dyn FnOnce() + Send>>(HANDSHAKE_QUEUE_SIZE);
         for _ in 0..workers {
             let rx = rx.clone();
             thread::spawn(move || {
@@ -639,8 +607,8 @@ impl HandshakeExecutor {
 
     async fn run<T>(
         &self,
-        work: impl FnOnce() -> ConnectionResult<T> + Send + 'static,
-    ) -> ConnectionResult<T>
+        work: impl FnOnce() -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error>
     where
         T: Send + 'static,
     {
@@ -650,34 +618,49 @@ impl HandshakeExecutor {
                 let _ = result_tx.send(work());
             }))
             .map_err(|error| match error {
-                TrySendError::Full(_) => ConnectionError::HandshakeOverloaded,
-                TrySendError::Closed(_) => ConnectionError::HandshakeWorkerStopped,
+                TrySendError::Full(_) => Error::HandshakeOverloaded,
+                TrySendError::Closed(_) => Error::HandshakeWorkerStopped,
             })?;
-        result_rx
-            .await
-            .map_err(|_| ConnectionError::HandshakeWorkerStopped)?
+        result_rx.await.map_err(|_| Error::HandshakeWorkerStopped)?
     }
 }
 
-impl From<io::Error> for ConnectionError {
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Error {
+    Io,
+    Codec,
+    Wire,
+    AttachRequired,
+    ChallengeActive,
+    ChallengeMissing,
+    ChallengeTimedOut,
+    RouteLimit,
+    HandshakeOverloaded,
+    HandshakeWorkerStopped,
+    WriterStopped,
+    Protocol,
+}
+
+impl From<io::Error> for Error {
     fn from(_: io::Error) -> Self {
         Self::Io
     }
 }
 
-impl From<ql_codec::Error> for ConnectionError {
+impl From<ql_codec::Error> for Error {
     fn from(_: ql_codec::Error) -> Self {
         Self::Codec
     }
 }
 
-impl From<ql_wire::Error> for ConnectionError {
+impl From<ql_wire::Error> for Error {
     fn from(_: ql_wire::Error) -> Self {
         Self::Wire
     }
 }
 
-impl fmt::Display for ConnectionError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io => f.write_str("I/O error"),

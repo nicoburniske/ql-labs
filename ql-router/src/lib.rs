@@ -157,12 +157,15 @@ pub async fn connect_udp_with_max_payload(
     let mut udp_packet: u64 = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let next_packet = udp_packet
-            .checked_add(1)
+        let packet_number = protocol::next_packet_number(&mut udp_packet)
             .ok_or_else(|| io::Error::other("UDP packet number exhausted during activation"))?;
-        let bind =
-            protocol::seal_packet(&udp_keys.tx, PacketKind::Bind, session_id, udp_packet, &[]);
-        udp_packet = next_packet;
+        let bind = protocol::seal_packet(
+            &udp_keys.tx,
+            PacketKind::Bind,
+            session_id,
+            packet_number,
+            &[],
+        );
         udp.send(&bind).await?;
 
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -246,12 +249,9 @@ pub async fn receive(receiver: &mut Receiver) -> io::Result<Option<Vec<u8>>> {
                 let Some(frame) = frame? else { return Ok(None) };
                 let (kind, number, payload) =
                     protocol::open_packet_owned(tcp_key, udp.session_id, frame)?;
-                let following_packet = next_tcp_packet.checked_add(1)
-                    .ok_or_else(|| io::Error::other("TCP packet number exhausted"))?;
-                if number != *next_tcp_packet {
+                if protocol::next_packet_number(next_tcp_packet) != Some(number) {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected TCP packet number"));
                 }
-                *next_tcp_packet = following_packet;
                 match kind {
                     PacketKind::Record => return Ok(Some(payload)),
                     PacketKind::UdpReady if payload.is_empty() => continue,
@@ -278,16 +278,15 @@ pub async fn send(sender: &mut Sender, record: &[u8]) -> io::Result<()> {
         && RecordHeader::decode_bytes(record)
             .is_ok_and(|header| header.record_type == RecordType::Session)
     {
-        if let Some(next_packet) = udp.next_packet.checked_add(1) {
+        if let Some(number) = protocol::next_packet_number(&mut udp.next_packet) {
             protocol::seal_packet_into(
                 &mut udp.buffer,
                 &udp.key,
                 PacketKind::Record,
                 udp.session_id,
-                udp.next_packet,
+                number,
                 record,
             );
-            udp.next_packet = next_packet;
             match udp.socket.try_send(&udp.buffer) {
                 Ok(_) => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -308,19 +307,16 @@ pub async fn attach(sender: &mut Sender, bundle: &PeerBundle) -> io::Result<()> 
 }
 
 async fn send_tcp_packet(sender: &mut Sender, kind: PacketKind, payload: &[u8]) -> io::Result<()> {
-    let next_packet = sender
-        .next_tcp_packet
-        .checked_add(1)
+    let number = protocol::next_packet_number(&mut sender.next_tcp_packet)
         .ok_or_else(|| io::Error::other("TCP packet number exhausted"))?;
     protocol::seal_packet_into(
         &mut sender.tcp_buffer,
         &sender.tcp_key,
         kind,
         sender.udp.session_id,
-        sender.next_tcp_packet,
+        number,
         payload,
     );
-    sender.next_tcp_packet = next_packet;
     protocol::write_frame(&mut sender.tcp, &sender.tcp_buffer).await
 }
 
@@ -394,6 +390,13 @@ pub mod protocol {
     pub struct UdpKeys {
         pub tx: SessionKey,
         pub rx: SessionKey,
+    }
+
+    #[inline]
+    pub fn next_packet_number(next: &mut u64) -> Option<u64> {
+        let number = *next;
+        *next = number.checked_add(1)?;
+        Some(number)
     }
 
     pub fn derive_udp_keys(handshake: &FinalizedHandshake) -> UdpKeys {
