@@ -204,16 +204,12 @@ impl Drop for Camera {
 
 fn start_camera() -> (Camera, Receiver<CameraFrame>) {
     use v4l::{
-        Format, FourCC,
+        FourCC,
         buffer::Type,
         io::traits::CaptureStream,
         prelude::{Device, MmapStream},
-        video::{Capture, capture::Parameters},
+        video::Capture,
     };
-
-    const CAMERA_WIDTH: u32 = 1920;
-    const CAMERA_HEIGHT: u32 = 1080;
-    const CAMERA_FPS: u32 = 60;
 
     let (device, format) = v4l::context::enum_devices()
         .into_iter()
@@ -228,15 +224,7 @@ fn start_camera() -> (Camera, Receiver<CameraFrame>) {
                 && (format.stride == 0 || format.stride == format.width)
         })
         .unwrap();
-    let format = device
-        .set_format(&Format::new(CAMERA_WIDTH, CAMERA_HEIGHT, format.fourcc))
-        .unwrap_or(format);
     assert!(format.stride == 0 || format.stride == format.width);
-    let parameters = device
-        .set_params(&Parameters::with_fps(CAMERA_FPS))
-        .unwrap();
-    assert_eq!(parameters.interval.numerator, 1);
-    assert_eq!(parameters.interval.denominator, CAMERA_FPS);
 
     let mut stream = MmapStream::with_buffers(&device, Type::VideoCapture, 4).unwrap();
     let width = format.width as usize;
