@@ -1,82 +1,39 @@
-use std::{io, sync::Arc};
+use std::io;
 
 use ql_codec::{Decode, Encode};
 use ql_wire::{
     HandshakeId, IkHandshake, PeerBundle, QlHandshakeRecord, RecordHeader, RecordType, RouteHeader,
     SessionKey, SoftwareCrypto, TransportParams, generate_identity,
 };
-use tokio::net::{TcpStream, ToSocketAddrs, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
+use tokio::net::{TcpStream, ToSocketAddrs, tcp::OwnedReadHalf, tcp::OwnedWriteHalf};
 
 use crate::protocol::PacketKind;
 
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1:7447";
-pub const DEFAULT_UDP_PAYLOAD: usize = 1200;
-pub const DEFAULT_UDP_RECORD_SIZE: usize = DEFAULT_UDP_PAYLOAD - protocol::PACKET_OVERHEAD;
 pub const MAX_RECORD_SIZE: usize = 8 * 1024;
 
 pub struct Receiver {
     tcp: OwnedReadHalf,
-    udp: UdpReceiver,
-    tcp_key: SessionKey,
-    next_tcp_packet: u64,
+    session_id: u64,
+    key: SessionKey,
+    next_packet: u64,
 }
 
 pub struct Sender {
     tcp: OwnedWriteHalf,
-    udp: UdpSender,
-    tcp_key: SessionKey,
-    next_tcp_packet: u64,
-    tcp_buffer: Vec<u8>,
-}
-
-struct UdpReceiver {
-    socket: Arc<UdpSocket>,
-    session_id: u64,
-    key: SessionKey,
-    buffer: Vec<u8>,
-}
-
-struct UdpSender {
-    socket: Arc<UdpSocket>,
     session_id: u64,
     key: SessionKey,
     next_packet: u64,
-    max_payload: usize,
     buffer: Vec<u8>,
 }
 
-pub async fn connect_udp(
+pub async fn connect(
     address: impl ToSocketAddrs,
     router: &PeerBundle,
 ) -> io::Result<(Receiver, Sender)> {
-    connect_udp_with_max_payload(address, router, DEFAULT_UDP_PAYLOAD).await
-}
-
-pub async fn connect_udp_with_max_payload(
-    address: impl ToSocketAddrs,
-    router: &PeerBundle,
-    max_payload: usize,
-) -> io::Result<(Receiver, Sender)> {
-    if max_payload > protocol::MAX_UDP_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid UDP payload limit",
-        ));
-    }
-
     router.validate(&SoftwareCrypto).map_err(invalid_data)?;
     let mut tcp = TcpStream::connect(address).await?;
     tcp.set_nodelay(true)?;
-    let peer = tcp.peer_addr()?;
-    let udp = Arc::new(
-        UdpSocket::bind(if peer.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        })
-        .await?,
-    );
-    udp.connect(peer).await?;
 
     let identity = generate_identity(&SoftwareCrypto, "QL router transport");
     let route = RouteHeader {
@@ -107,17 +64,9 @@ pub async fn connect_udp_with_max_payload(
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "router disconnected"))?;
     let protocol::TransportResponse {
         session_id,
-        max_udp_payload,
         header,
         handshake: response,
     } = protocol::TransportResponse::decode_bytes(response.as_slice()).map_err(invalid_data)?;
-    let router_max_payload = max_udp_payload as usize;
-    if router_max_payload > protocol::MAX_UDP_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid router UDP payload limit",
-        ));
-    }
     let QlHandshakeRecord::Ik2(response) = response else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -134,49 +83,26 @@ pub async fn connect_udp_with_max_payload(
             "transport peer does not match router",
         ));
     }
-    let udp_keys = protocol::derive_udp_keys(&finalized);
-    let tcp_tx = finalized.tx_key;
-    let tcp_rx = finalized.rx_key;
+    let tx_key = finalized.tx_key;
+    let rx_key = finalized.rx_key;
 
-    let confirmation_payload = protocol::TransportConfirmation {
-        max_udp_payload: max_payload as u32,
-    }
-    .encode_vec();
-    let confirmation = protocol::seal_packet(
-        &tcp_tx,
-        PacketKind::Confirm,
-        session_id,
-        0,
-        &confirmation_payload,
-    );
+    let confirmation = protocol::seal_packet(&tx_key, PacketKind::Confirm, session_id, 0, &[]);
     protocol::write_frame(&mut tcp, &confirmation).await?;
 
     let (tcp, writer) = tcp.into_split();
     Ok((
         Receiver {
             tcp,
-            udp: UdpReceiver {
-                socket: udp.clone(),
-                session_id,
-                key: udp_keys.rx,
-                buffer: vec![0; max_payload],
-            },
-            tcp_key: tcp_rx,
-            next_tcp_packet: 0,
+            session_id,
+            key: rx_key,
+            next_packet: 0,
         },
         Sender {
             tcp: writer,
-            udp: UdpSender {
-                socket: udp,
-                session_id,
-                key: udp_keys.tx,
-                next_packet: 0,
-                max_payload: router_max_payload,
-                buffer: Vec::with_capacity(router_max_payload),
-            },
-            tcp_key: tcp_tx,
-            next_tcp_packet: 1,
-            tcp_buffer: Vec::new(),
+            session_id,
+            key: tx_key,
+            next_packet: 1,
+            buffer: Vec::new(),
         },
     ))
 }
@@ -184,77 +110,50 @@ pub async fn connect_udp_with_max_payload(
 pub async fn receive(receiver: &mut Receiver) -> io::Result<Option<Vec<u8>>> {
     let Receiver {
         tcp,
-        udp,
-        tcp_key,
-        next_tcp_packet,
+        session_id,
+        key,
+        next_packet,
     } = receiver;
-    loop {
-        tokio::select! {
-            frame = protocol::read_frame(tcp) => {
-                let Some(frame) = frame? else { return Ok(None) };
-                let (kind, number, payload) =
-                    protocol::open_packet_owned(tcp_key, udp.session_id, frame)?;
-                if protocol::next_packet_number(next_tcp_packet) != Some(number) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected TCP packet number"));
-                }
-                match kind {
-                    PacketKind::Record => return Ok(Some(payload)),
-                    _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected router packet")),
-                }
-            }
-            received = udp.socket.recv(&mut udp.buffer) => {
-                let len = received?;
-                let Ok(packet) = protocol::open_packet(&udp.key, udp.session_id, &udp.buffer[..len]) else {
-                    continue;
-                };
-                if packet.kind == PacketKind::Record {
-                    return Ok(Some(packet.payload.to_vec()));
-                }
-            }
-        }
+    let Some(frame) = protocol::read_frame(tcp).await? else {
+        return Ok(None);
+    };
+    let (kind, number, payload) = protocol::open_packet_owned(key, *session_id, frame)?;
+    if protocol::next_packet_number(next_packet) != Some(number) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected TCP packet number",
+        ));
+    }
+    match kind {
+        PacketKind::Record => Ok(Some(payload)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected router packet",
+        )),
     }
 }
 
 pub async fn send(sender: &mut Sender, record: &[u8]) -> io::Result<()> {
-    let udp = &mut sender.udp;
-    if record.len() + protocol::PACKET_OVERHEAD <= udp.max_payload
-        && RecordHeader::decode_bytes(record)
-            .is_ok_and(|header| header.record_type == RecordType::Session)
-    {
-        if let Some(number) = protocol::next_packet_number(&mut udp.next_packet) {
-            protocol::seal_packet_into(
-                &mut udp.buffer,
-                &udp.key,
-                PacketKind::Record,
-                udp.session_id,
-                number,
-                record,
-            );
-            let _ = udp.socket.try_send(&udp.buffer);
-            return Ok(());
-        }
-        return Ok(());
-    }
-    send_tcp_packet(sender, PacketKind::Record, record).await
+    send_packet(sender, PacketKind::Record, record).await
 }
 
 pub async fn attach(sender: &mut Sender, bundle: &PeerBundle) -> io::Result<()> {
     let payload = bundle.encode_vec();
-    send_tcp_packet(sender, PacketKind::Attach, &payload).await
+    send_packet(sender, PacketKind::Attach, &payload).await
 }
 
-async fn send_tcp_packet(sender: &mut Sender, kind: PacketKind, payload: &[u8]) -> io::Result<()> {
-    let number = protocol::next_packet_number(&mut sender.next_tcp_packet)
-        .ok_or_else(|| io::Error::other("TCP packet number exhausted"))?;
+async fn send_packet(sender: &mut Sender, kind: PacketKind, payload: &[u8]) -> io::Result<()> {
+    let number = protocol::next_packet_number(&mut sender.next_packet)
+        .ok_or_else(|| io::Error::other("packet number exhausted"))?;
     protocol::seal_packet_into(
-        &mut sender.tcp_buffer,
-        &sender.tcp_key,
+        &mut sender.buffer,
+        &sender.key,
         kind,
-        sender.udp.session_id,
+        sender.session_id,
         number,
         payload,
     );
-    protocol::write_frame(&mut sender.tcp, &sender.tcp_buffer).await
+    protocol::write_frame(&mut sender.tcp, &sender.buffer).await
 }
 
 fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
@@ -264,25 +163,20 @@ fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Er
 pub mod protocol {
     use std::{io, mem::size_of};
 
-    use hkdf::Hkdf;
     use ql_codec::{Decode, Encode, codec};
     use ql_wire::{
-        ENCRYPTED_MESSAGE_AUTH_SIZE, FinalizedHandshake, Nonce, QlAead, QlHandshakeRecord,
-        RecordHeader, SessionKey, SoftwareCrypto,
+        ENCRYPTED_MESSAGE_AUTH_SIZE, Nonce, QlAead, QlHandshakeRecord, RecordHeader, SessionKey,
+        SoftwareCrypto,
     };
-    use sha2::Sha256;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use crate::MAX_RECORD_SIZE;
 
-    pub const PACKET_OVERHEAD: usize = PACKET_HEADER_SIZE + ENCRYPTED_MESSAGE_AUTH_SIZE;
-    pub const MAX_UDP_PAYLOAD: usize = PACKET_OVERHEAD + MAX_RECORD_SIZE;
-
     const FRAME_HEADER_SIZE: usize = 4;
+    const PACKET_OVERHEAD: usize = PACKET_HEADER_SIZE + ENCRYPTED_MESSAGE_AUTH_SIZE;
     const MAX_FRAME_SIZE: usize = MAX_RECORD_SIZE + PACKET_OVERHEAD;
     const PACKET_VERSION: u8 = 1;
-    const PACKET_HEADER_SIZE: usize = size_of::<u8>() + size_of::<u64>() * 2;
-    const UDP_KEY_INFO: &[u8] = b"ql-router:transport-keys:v1:udp";
+    const PACKET_HEADER_SIZE: usize = size_of::<u8>() * 2 + size_of::<u64>() * 2;
 
     codec! {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,7 +189,8 @@ pub mod protocol {
 
     codec! {
         pub struct PacketHeader {
-            pub version_and_kind: u8,
+            pub version: u8,
+            pub kind: PacketKind,
             pub session_id: u64,
             pub number: u64,
         }
@@ -304,15 +199,8 @@ pub mod protocol {
     codec! {
         pub struct TransportResponse {
             pub session_id: u64,
-            pub max_udp_payload: u32,
             pub header: RecordHeader,
             pub handshake: QlHandshakeRecord,
-        }
-    }
-
-    codec! {
-        pub struct TransportConfirmation {
-            pub max_udp_payload: u32,
         }
     }
 
@@ -322,30 +210,11 @@ pub mod protocol {
         pub payload: &'a [u8],
     }
 
-    pub struct UdpKeys {
-        pub tx: SessionKey,
-        pub rx: SessionKey,
-    }
-
     #[inline]
     pub fn next_packet_number(next: &mut u64) -> Option<u64> {
         let number = *next;
         *next = number.checked_add(1)?;
         Some(number)
-    }
-
-    pub fn derive_udp_keys(handshake: &FinalizedHandshake) -> UdpKeys {
-        let derive = |key: &SessionKey, info: &[u8]| {
-            let hkdf = Hkdf::<Sha256>::new(Some(&handshake.handshake_hash), key.as_bytes());
-            let mut out = [0; SessionKey::SIZE];
-            hkdf.expand(info, &mut out)
-                .expect("fixed transport key size");
-            SessionKey(out)
-        };
-        UdpKeys {
-            tx: derive(&handshake.tx_key, UDP_KEY_INFO),
-            rx: derive(&handshake.rx_key, UDP_KEY_INFO),
-        }
     }
 
     pub fn seal_packet(
@@ -371,7 +240,8 @@ pub mod protocol {
         packet.clear();
         packet.reserve(PACKET_OVERHEAD + payload.len());
         PacketHeader {
-            version_and_kind: PACKET_VERSION << 4 | kind as u8,
+            version: PACKET_VERSION,
+            kind,
             session_id,
             number,
         }
@@ -399,16 +269,13 @@ pub mod protocol {
             ));
         }
         let header = PacketHeader::decode_bytes(packet).map_err(super::invalid_data)?;
-        if header.version_and_kind >> 4 != PACKET_VERSION
-            || header.session_id != expected_session_id
-        {
+        if header.version != PACKET_VERSION || header.session_id != expected_session_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid authenticated packet header",
             ));
         }
-        let kind =
-            PacketKind::try_from(header.version_and_kind & 0x0f).map_err(super::invalid_data)?;
+        let kind = header.kind;
         let tag_at = packet.len() - ENCRYPTED_MESSAGE_AUTH_SIZE;
         let tag = <[u8; ENCRYPTED_MESSAGE_AUTH_SIZE]>::decode_bytes(&packet[tag_at..])
             .map_err(super::invalid_data)?;

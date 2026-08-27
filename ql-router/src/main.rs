@@ -1,13 +1,11 @@
 use std::{
-    borrow::Cow,
     collections::HashSet,
     fmt, fs,
     io::{self, ErrorKind},
-    net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -16,10 +14,11 @@ use figment::{
     Figment,
     providers::{Env, Serialized},
 };
+use futures_lite::future;
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
 use ql_router::{
-    DEFAULT_ADDRESS, DEFAULT_UDP_PAYLOAD, MAX_RECORD_SIZE,
+    DEFAULT_ADDRESS,
     protocol::{self, PacketKind},
 };
 use ql_wire::{
@@ -29,7 +28,7 @@ use ql_wire::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener, TcpStream},
     sync::{Semaphore, SemaphorePermit, mpsc},
     time::{Instant, timeout, timeout_at},
 };
@@ -46,7 +45,6 @@ type ConnectionId = u64;
 struct Config {
     log: String,
     address: String,
-    udp_max_payload: usize,
     identity_path: PathBuf,
     bundle_path: PathBuf,
 }
@@ -56,7 +54,6 @@ impl Default for Config {
         Self {
             log: "INFO".into(),
             address: DEFAULT_ADDRESS.into(),
-            udp_max_payload: DEFAULT_UDP_PAYLOAD,
             identity_path: "ql-router/identity.bin".into(),
             bundle_path: "ql-router/bundle.bin".into(),
         }
@@ -75,8 +72,6 @@ struct Router {
     challenge_capacity: Semaphore,
     connections: DashMap<ConnectionId, Arc<Connection>>,
     routes: DashMap<QID, ConnectionId>,
-    udp: UdpSocket,
-    udp_max_payload: usize,
 }
 
 impl Router {
@@ -88,34 +83,19 @@ impl Router {
 
 struct Connection {
     outbound: mpsc::Sender<Vec<u8>>,
-    udp: UdpSession,
-}
-
-struct UdpSession {
-    rx_key: SessionKey,
-    tx_key: SessionKey,
-    address: OnceLock<SocketAddr>,
-    sender: Mutex<UdpSender>,
-    peer_max_payload: usize,
-}
-
-struct UdpSender {
-    next_packet: u64,
-    packet: Vec<u8>,
 }
 
 struct Inbound {
-    tcp_key: SessionKey,
-    next_tcp_packet: u64,
+    key: SessionKey,
+    next_packet: u64,
     challenge: Option<ActiveChallenge>,
     next_handshake_id: u32,
     routes: HashSet<QID>,
 }
 
 struct NegotiatedTransport {
-    tcp_tx: SessionKey,
-    tcp_rx: SessionKey,
-    udp: UdpSession,
+    tx_key: SessionKey,
+    rx_key: SessionKey,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -128,11 +108,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let listener = TcpListener::bind(&config.address).await?;
-    let udp = UdpSocket::bind(listener.local_addr()?).await?;
-    let udp_max_payload = config.udp_max_payload;
-    if udp_max_payload > protocol::MAX_UDP_PAYLOAD {
-        anyhow::bail!("invalid QL_ROUTER_UDP_MAX_PAYLOAD");
-    }
 
     let identity = match fs::read(&config.identity_path) {
         Ok(bytes) => QlIdentity::decode_bytes(bytes.as_slice())?,
@@ -156,14 +131,11 @@ async fn main() -> anyhow::Result<()> {
         challenge_capacity: Semaphore::new(MAX_PENDING_HANDSHAKES),
         connections: DashMap::new(),
         routes: DashMap::new(),
-        udp,
-        udp_max_payload,
     }));
     info!(
         workers = handshake_workers,
         pending = MAX_PENDING_HANDSHAKES,
         routes_per_connection = MAX_ROUTES_PER_CONNECTION,
-        udp_max_payload,
         "QL router limits configured"
     );
     info!(address = %listener.local_addr()?, "QL router listening on");
@@ -172,12 +144,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(router: &'static Router, listener: TcpListener) -> anyhow::Result<()> {
-    tokio::spawn(async move {
-        if let Err(error) = serve_udp(router).await {
-            tracing::error!(%error, "UDP listener stopped");
-        }
-    });
-
     loop {
         let (stream, remote) = listener.accept().await?;
         let connection = loop {
@@ -206,11 +172,7 @@ async fn serve(
     connection: ConnectionId,
     mut stream: TcpStream,
 ) -> Result<(), Error> {
-    let NegotiatedTransport {
-        tcp_tx,
-        tcp_rx,
-        udp,
-    } = timeout(HANDSHAKE_TIMEOUT, async {
+    let NegotiatedTransport { tx_key, rx_key } = timeout(HANDSHAKE_TIMEOUT, async {
         let request = protocol::read_frame(&mut stream)
             .await?
             .ok_or(Error::Protocol)?;
@@ -223,45 +185,19 @@ async fn serve(
 
     let connection_state = Arc::new(Connection {
         outbound: outbound.clone(),
-        udp,
     });
     router
         .connections
         .insert(connection, connection_state.clone());
 
-    let writer = tokio::spawn(
-        async move {
-            let mut packet_number: u64 = 0;
-            let mut packet = Vec::new();
-            while let Some(message) = outbound_rx.recv().await {
-                let Some(number) = protocol::next_packet_number(&mut packet_number) else {
-                    break;
-                };
-                protocol::seal_packet_into(
-                    &mut packet,
-                    &tcp_tx,
-                    PacketKind::Record,
-                    connection,
-                    number,
-                    &message,
-                );
-                if let Err(error) = protocol::write_frame(&mut writer, &packet).await {
-                    debug!(%error, "connection write failed");
-                    break;
-                }
-            }
-        }
-        .in_current_span(),
-    );
-
     let mut inbound = Inbound {
-        tcp_key: tcp_rx,
-        next_tcp_packet: 1,
+        key: rx_key,
+        next_packet: 1,
         challenge: None,
         next_handshake_id: 1,
         routes: HashSet::new(),
     };
-    let result = async {
+    let read = async {
         loop {
             let packet = if let Some(challenge) = inbound.challenge.as_ref() {
                 timeout_at(challenge.deadline, protocol::read_frame(&mut reader))
@@ -274,10 +210,26 @@ async fn serve(
             handle_inbound(router, packet, connection, &outbound, &mut inbound).await?;
         }
         Ok(())
-    }
-    .await;
+    };
+    let write = async move {
+        let mut packet_number: u64 = 0;
+        let mut packet = Vec::new();
+        while let Some(message) = outbound_rx.recv().await {
+            let number = protocol::next_packet_number(&mut packet_number).ok_or(Error::Protocol)?;
+            protocol::seal_packet_into(
+                &mut packet,
+                &tx_key,
+                PacketKind::Record,
+                connection,
+                number,
+                &message,
+            );
+            protocol::write_frame(&mut writer, &packet).await?;
+        }
+        Ok(())
+    };
+    let result = future::race(read, write).await;
 
-    writer.abort();
     router.connections.remove_if(&connection, |_, current| {
         Arc::ptr_eq(current, &connection_state)
     });
@@ -295,7 +247,7 @@ async fn negotiate_transport(
     request: Vec<u8>,
     stream: &mut TcpStream,
 ) -> Result<NegotiatedTransport, Error> {
-    let (response, tcp_tx, tcp_rx, udp_keys) = router
+    let (response, tx_key, rx_key) = router
         .handshake(|| {
             let (header, request) =
                 ql_wire::decode_record::<QlHandshakeRecord, _>(request.as_slice())?;
@@ -317,7 +269,6 @@ async fn negotiate_transport(
             let response = handshake.write_2(&SoftwareCrypto, request.handshake_id)?;
             let response = protocol::TransportResponse {
                 session_id: connection,
-                max_udp_payload: router.udp_max_payload as u32,
                 header: RecordHeader::new(
                     RouteHeader {
                         sender: header.route.recipient,
@@ -328,8 +279,7 @@ async fn negotiate_transport(
                 handshake: QlHandshakeRecord::Ik2(response),
             };
             let finalized = handshake.finalize(&SoftwareCrypto)?;
-            let udp_keys = protocol::derive_udp_keys(&finalized);
-            Ok((response, finalized.tx_key, finalized.rx_key, udp_keys))
+            Ok((response, finalized.tx_key, finalized.rx_key))
         })
         .await?;
 
@@ -337,77 +287,15 @@ async fn negotiate_transport(
     protocol::write_frame(stream, &response.encode_vec()).await?;
 
     let confirmation = protocol::read_frame(stream).await?.ok_or(Error::Protocol)?;
-    let confirmation = protocol::open_packet(&tcp_rx, session_id, &confirmation)?;
-    if confirmation.kind != PacketKind::Confirm || confirmation.number != 0 {
-        return Err(Error::Protocol);
-    }
-    let peer_max_payload = protocol::TransportConfirmation::decode_bytes(confirmation.payload)?
-        .max_udp_payload as usize;
-    if peer_max_payload > protocol::MAX_UDP_PAYLOAD {
+    let confirmation = protocol::open_packet(&rx_key, session_id, &confirmation)?;
+    if confirmation.kind != PacketKind::Confirm
+        || confirmation.number != 0
+        || !confirmation.payload.is_empty()
+    {
         return Err(Error::Protocol);
     }
 
-    Ok(NegotiatedTransport {
-        tcp_tx,
-        tcp_rx,
-        udp: UdpSession {
-            rx_key: udp_keys.rx,
-            tx_key: udp_keys.tx,
-            address: OnceLock::new(),
-            sender: Mutex::new(UdpSender {
-                next_packet: 0,
-                packet: Vec::with_capacity(peer_max_payload),
-            }),
-            peer_max_payload,
-        },
-    })
-}
-
-async fn serve_udp(router: &Router) -> io::Result<()> {
-    let mut buffer = vec![0; router.udp_max_payload];
-    loop {
-        let (len, source) = router.udp.recv_from(&mut buffer).await?;
-        let packet = &buffer[..len];
-        if packet.len() < protocol::PACKET_OVERHEAD {
-            continue;
-        }
-        let Ok(header) = protocol::PacketHeader::decode_bytes(packet) else {
-            continue;
-        };
-        let session_id = header.session_id;
-        let Some(connection) = router
-            .connections
-            .get(&session_id)
-            .map(|connection| connection.clone())
-        else {
-            continue;
-        };
-        let session = &connection.udp;
-        let bound = session.address.get();
-        if bound.is_some_and(|address| *address != source) {
-            continue;
-        }
-        let Ok(packet) = protocol::open_packet(&session.rx_key, session_id, packet) else {
-            continue;
-        };
-        if packet.kind == PacketKind::Record {
-            if packet.payload.len() > MAX_RECORD_SIZE {
-                continue;
-            }
-            let Ok(header) = RecordHeader::decode_bytes(packet.payload) else {
-                continue;
-            };
-            if header.record_type != RecordType::Session
-                || header.route.recipient == router.identity.qid
-            {
-                continue;
-            }
-            if bound.is_none() {
-                session.address.set(source).unwrap();
-            }
-            let _ = route_record(router, Cow::Borrowed(packet.payload), header, session_id);
-        }
-    }
+    Ok(NegotiatedTransport { tx_key, rx_key })
 }
 
 async fn handle_inbound(
@@ -417,9 +305,8 @@ async fn handle_inbound(
     outbound: &mpsc::Sender<Vec<u8>>,
     inbound: &mut Inbound,
 ) -> Result<(), Error> {
-    let (kind, number, payload) =
-        protocol::open_packet_owned(&inbound.tcp_key, connection, packet)?;
-    if protocol::next_packet_number(&mut inbound.next_tcp_packet) != Some(number) {
+    let (kind, number, payload) = protocol::open_packet_owned(&inbound.key, connection, packet)?;
+    if protocol::next_packet_number(&mut inbound.next_packet) != Some(number) {
         return Err(Error::Protocol);
     }
 
@@ -492,12 +379,12 @@ async fn handle_inbound(
         return Ok(());
     }
 
-    route_record(router, Cow::Owned(record), header, connection)
+    route_record(router, record, header, connection).await
 }
 
-fn route_record<'a>(
+async fn route_record(
     router: &Router,
-    record: Cow<'a, [u8]>,
+    record: Vec<u8>,
     header: RecordHeader,
     ingress: ConnectionId,
 ) -> Result<(), Error> {
@@ -533,34 +420,7 @@ fn route_record<'a>(
         return Ok(());
     };
 
-    if header.record_type == RecordType::Session
-        && record.len() + protocol::PACKET_OVERHEAD <= egress.udp.peer_max_payload
-    {
-        let udp = &egress.udp;
-        if let Some(&address) = udp.address.get() {
-            let mut sender = udp.sender.lock().unwrap();
-            let Some(number) = protocol::next_packet_number(&mut sender.next_packet) else {
-                return Ok(());
-            };
-            protocol::seal_packet_into(
-                &mut sender.packet,
-                &udp.tx_key,
-                PacketKind::Record,
-                egress_id,
-                number,
-                record.as_ref(),
-            );
-            let _ = router.udp.try_send_to(&sender.packet, address);
-            return Ok(());
-        }
-    }
-
-    if let Err(mpsc::error::TrySendError::Full(_)) = egress.outbound.try_send(record.into_owned()) {
-        debug!(
-            connection = egress_id,
-            "outbound queue full; dropping record"
-        );
-    }
+    let _ = egress.outbound.send(record).await;
     Ok(())
 }
 

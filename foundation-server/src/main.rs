@@ -10,7 +10,7 @@ use figment::{
 };
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
-use ql_router::{DEFAULT_ADDRESS, DEFAULT_UDP_RECORD_SIZE, attach, connect_udp, receive, send};
+use ql_router::{DEFAULT_ADDRESS, attach, connect, receive, send};
 use ql_runtime::{RuntimeConfig, RuntimeHandle, new_runtime};
 use ql_wire::{
     PeerBundle, QlHandshakeRecord, QlIdentity, RecordHeader, RecordType, SoftwareCrypto,
@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
 
     let router_bundle = fs::read(&config.router.bundle_path)?;
     let router = PeerBundle::decode_bytes(router_bundle.as_slice())?;
-    let (mut reader, mut writer) = connect_udp(&config.router.address, &router).await?;
+    let (mut reader, mut writer) = connect(&config.router.address, &router).await?;
 
     attach(&mut writer, &identity.bundle()).await?;
     let request = receive(&mut reader).await?.unwrap();
@@ -143,9 +143,7 @@ async fn handle_inbound(
 
     let (inbound, inbound_rx) = mpsc::channel(64);
     let platform = Platform::new(sender, outbound.clone(), inbound_rx, peers.clone());
-    let mut config = RuntimeConfig::default();
-    config.fsm.session.record_max_size = DEFAULT_UDP_RECORD_SIZE;
-    let (runtime, handle) = new_runtime(identity.clone(), platform, config);
+    let (runtime, handle) = new_runtime(identity.clone(), platform, RuntimeConfig::default());
     inbound.send(record).await.expect("new runtime is alive");
     peers.insert(
         sender,

@@ -1,23 +1,18 @@
 # ql-router
 
-`ql-router` is a minimal authenticated relay for QL peers. It proves which QIDs belong to each live connection, looks up the recipient, and forwards complete QL records unchanged. QL payloads remain end-to-end encrypted.
+`ql-router` is a minimal authenticated TCP relay for QL peers. It proves which QIDs belong to each live connection, looks up the recipient, and forwards complete QL records unchanged. QL payloads remain end-to-end encrypted.
 
 ```text
 peer A                         router                         peer B
   |--- TCP: IK + Confirm ------->|<----- TCP: IK + Confirm -----|
-  |--- TCP: Attach + proof ----->|<---- TCP: Attach + proof ----|
+  |--- Attach + proof ---------->|<---- Attach + proof ---------|
   |                              |                              |
-  |=== UDP: [auth | QL record] =>| bind address, validate route |
-  |                              |-- TCP fallback ------------->|
-  |                              |                              |
-  |                              |<== UDP: [auth | QL record] ==|
-  |<== UDP: [auth | QL record] ==| validate sender and route    |
+  |--- authenticated QL record ->| validate sender and route    |
+  |                              |--- authenticated QL record ->|
 ```
 
-TCP carries setup, QID attachment, control messages, and session records that do not fit in one UDP payload. The router also uses TCP for egress until it has learned the recipient connection's UDP address.
+The transport IK handshake authenticates the router against its known peer bundle and derives independent keys for each direction. Transport packets carry a session ID and strictly increasing packet number. Their authentication tag covers control payloads in full and the routing metadata of QL records. The encrypted QL body remains opaque to the router and is authenticated end to end by QL.
 
-UDP packets carry a transport session ID, packet number, QL record, and authentication tag. The first authenticated UDP session record binds its source address to the live TCP transport session. The address cannot change during the connection, and packets from another source are dropped.
+After connecting, a client attaches a peer bundle and answers a challenge from that identity. The router only accepts records whose sender QID was authenticated on the same connection. A connection may own up to 64 routes.
 
-The router authenticates the routing metadata, verifies that the sender QID is attached, then wraps the unchanged record for the recipient transport. The default UDP payload limit is 1,200 bytes, leaving 1,167 bytes for the complete QL session record after the router header and authentication tag. Larger QL records use TCP.
-
-The router provides no delivery, retransmission, ordering, congestion control, fragmentation, or replay filtering. UDP sends are attempted once; QL peers handle end-to-end reliability and duplicate records.
+TCP carries setup, route attachment, and QL records using length-delimited frames. Each record is limited to 8 KiB. Per-recipient queues are bounded and apply backpressure when a recipient is slower than its senders. Records for missing or disconnected recipients are dropped; QL remains responsible for end-to-end session recovery.

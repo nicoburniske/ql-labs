@@ -7,7 +7,7 @@ use std::{
 
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
-use ql_router::{Receiver, Sender, attach, connect_udp, receive, send};
+use ql_router::{Receiver, Sender, attach, connect, receive, send};
 use ql_wire::{
     PeerBundle, QL_WIRE_VERSION, QlIdentity, RecordHeader, RecordType, RouteHeader, SoftwareCrypto,
     answer_peer_challenge, generate_identity,
@@ -28,7 +28,7 @@ impl Drop for RouterProcess {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authenticated_udp_routes_only_attached_senders() {
+async fn authenticated_tcp_routes_only_attached_senders() {
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -70,9 +70,9 @@ async fn authenticated_udp_routes_only_attached_senders() {
     let crypto = SoftwareCrypto;
     let alice = generate_identity(&crypto, "alice");
     let bob = generate_identity(&crypto, "bob");
-    let (mut alice_rx, mut alice_tx) = connect_udp(&address, &router).await.unwrap();
+    let (mut alice_rx, mut alice_tx) = connect(&address, &router).await.unwrap();
     authenticate(&mut alice_rx, &mut alice_tx, &alice, &router).await;
-    let (mut bob_rx, mut bob_tx) = connect_udp(&address, &router).await.unwrap();
+    let (mut bob_rx, mut bob_tx) = connect(&address, &router).await.unwrap();
     authenticate(&mut bob_rx, &mut bob_tx, &bob, &router).await;
 
     let forged = record(QID([9; QID::SIZE]), bob.qid, 32);

@@ -561,7 +561,7 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
             }
         };
         let (mut reader, mut writer) =
-            match ql_router::connect_udp(ql_router::DEFAULT_ADDRESS, &router).await {
+            match ql_router::connect(ql_router::DEFAULT_ADDRESS, &router).await {
                 Ok(connection) => connection,
                 Err(error) => {
                     tracing::warn!(%error, "QL router unavailable");
