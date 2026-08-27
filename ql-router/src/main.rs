@@ -15,7 +15,7 @@ use figment::{
     providers::{Env, Serialized},
 };
 use futures_lite::future;
-use ql_codec::{Decode, Encode};
+use ql_codec::{Decode, Encode, Reader};
 use ql_common::QID;
 use ql_router::{
     DEFAULT_ADDRESS,
@@ -241,11 +241,8 @@ async fn negotiate_transport(
 ) -> Result<NegotiatedTransport, Error> {
     let (response, tx_key, rx_key) = router
         .handshake(|| {
-            let (header, request) =
-                ql_wire::decode_record::<QlHandshakeRecord, _>(request.payload())?;
-            if header.route.recipient != router.identity.qid
-                || header.record_type != RecordType::Handshake
-            {
+            let (header, request) = protocol::decode_handshake(request.payload())?;
+            if header.route.recipient != router.identity.qid {
                 return Err(Error::Protocol);
             }
             let QlHandshakeRecord::Ik1(request) = request else {
@@ -259,22 +256,22 @@ async fn negotiate_transport(
             );
             handshake.read_1(&SoftwareCrypto, header.route, &request)?;
             let response = handshake.write_2(&SoftwareCrypto, request.handshake_id)?;
-            let response = protocol::TransportResponse {
-                header: RecordHeader::new(
+            let response = ql_wire::encode_record_vec(
+                RecordHeader::new(
                     RouteHeader {
                         sender: header.route.recipient,
                         recipient: header.route.sender,
                     },
                     RecordType::Handshake,
                 ),
-                handshake: QlHandshakeRecord::Ik2(response),
-            };
+                &QlHandshakeRecord::Ik2(response),
+            );
             let finalized = handshake.finalize(&SoftwareCrypto)?;
             Ok((response, finalized.tx_key, finalized.rx_key))
         })
         .await?;
 
-    protocol::write_frame(stream, &response.encode_vec()).await?;
+    protocol::write_frame(stream, &response).await?;
 
     let confirmation = protocol::read_frame(stream).await?.ok_or(Error::Protocol)?;
     let confirmation = protocol::open_packet(&rx_key, 0, confirmation.as_bytes())?;
@@ -314,7 +311,11 @@ async fn handle_inbound(
                 .map_err(|_| Error::HandshakeOverloaded)?;
             let (qid, pending, request) = router
                 .handshake(|| -> Result<_, Error> {
-                    let bundle = PeerBundle::decode_bytes(payload.as_slice())?;
+                    let mut payload = Reader::new(payload.as_slice());
+                    let bundle = payload.decode::<PeerBundle>()?;
+                    if !payload.is_empty() {
+                        return Err(Error::Protocol);
+                    }
                     bundle.validate(&SoftwareCrypto)?;
                     let qid = bundle.qid;
                     let (pending, request) = PeerChallenge::new(
@@ -354,12 +355,12 @@ async fn handle_inbound(
         let (qid, accepted) = router
             .handshake(|| pending.verify(&SoftwareCrypto, &record))
             .await?;
-        inbound.routes.insert(qid);
-        router.routes.insert(qid, connection);
         outbound
             .send(accepted)
             .await
             .map_err(|_| Error::WriterStopped)?;
+        inbound.routes.insert(qid);
+        router.routes.insert(qid, connection);
         info!(connection, qid = %hex::encode(qid.0), "authenticated QID");
         return Ok(());
     }

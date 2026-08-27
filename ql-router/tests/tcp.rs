@@ -7,7 +7,7 @@ use std::{
 
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
-use ql_router::{Receiver, Sender, attach, connect, receive, send};
+use ql_router::{MAX_RECORD_SIZE, Receiver, Sender, attach, connect, receive, send};
 use ql_wire::{
     PeerBundle, QL_WIRE_VERSION, QlIdentity, RecordHeader, RecordType, RouteHeader, SoftwareCrypto,
     answer_peer_challenge, generate_identity,
@@ -103,14 +103,35 @@ async fn authenticated_tcp_routes_only_attached_senders() {
         Some(small)
     );
 
-    let oversized = record(bob.qid, alice.qid, 1400);
-    send(&mut bob_tx, &oversized).await.unwrap();
+    let largest = record(
+        bob.qid,
+        alice.qid,
+        MAX_RECORD_SIZE - RecordHeader::WIRE_SIZE,
+    );
+    send(&mut bob_tx, &largest).await.unwrap();
     assert_eq!(
         timeout(Duration::from_secs(2), receive(&mut alice_rx))
             .await
             .unwrap()
             .unwrap(),
-        Some(oversized)
+        Some(largest)
+    );
+
+    let oversized = record(
+        bob.qid,
+        alice.qid,
+        MAX_RECORD_SIZE + 1 - RecordHeader::WIRE_SIZE,
+    );
+    assert!(send(&mut bob_tx, &oversized).await.is_err());
+
+    let after_error = record(bob.qid, alice.qid, 32);
+    send(&mut bob_tx, &after_error).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), receive(&mut alice_rx))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(after_error)
     );
 }
 

@@ -60,10 +60,8 @@ pub async fn connect(
     let response = protocol::read_frame(&mut tcp)
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "router disconnected"))?;
-    let protocol::TransportResponse {
-        header,
-        handshake: response,
-    } = protocol::TransportResponse::decode_bytes(response.payload()).map_err(invalid_data)?;
+    let (header, response) =
+        protocol::decode_handshake(response.payload()).map_err(invalid_data)?;
     let QlHandshakeRecord::Ik2(response) = response else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -129,6 +127,12 @@ pub async fn attach(sender: &mut Sender, bundle: &PeerBundle) -> io::Result<()> 
 }
 
 async fn send_packet(sender: &mut Sender, kind: PacketKind, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > MAX_RECORD_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame exceeds the transport limit",
+        ));
+    }
     let nonce = protocol::take_counter(&mut sender.counter)
         .ok_or_else(|| io::Error::other("nonce counter exhausted"))?;
     protocol::seal_packet_into(&mut sender.buffer, &sender.key, kind, nonce, payload)?;
@@ -142,10 +146,10 @@ fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Er
 pub mod protocol {
     use std::io;
 
-    use ql_codec::{Decode, Encode, codec};
+    use ql_codec::{Decode, Encode, Reader, codec};
     use ql_wire::{
-        ENCRYPTED_MESSAGE_AUTH_SIZE, Nonce, QlAead, QlHandshakeRecord, RecordHeader, SessionKey,
-        SoftwareCrypto,
+        ENCRYPTED_MESSAGE_AUTH_SIZE, Nonce, QL_WIRE_VERSION, QlAead, QlHandshakeRecord,
+        RecordHeader, RecordType, SessionKey, SoftwareCrypto,
     };
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -165,13 +169,6 @@ pub mod protocol {
         }
     }
 
-    codec! {
-        pub struct TransportResponse {
-            pub header: RecordHeader,
-            pub handshake: QlHandshakeRecord,
-        }
-    }
-
     pub struct Frame(Vec<u8>);
 
     impl Frame {
@@ -187,6 +184,21 @@ pub mod protocol {
     pub struct Packet<'a> {
         pub kind: PacketKind,
         pub payload: &'a [u8],
+    }
+
+    pub fn decode_handshake(
+        bytes: &[u8],
+    ) -> Result<(RecordHeader, QlHandshakeRecord), ql_codec::Error> {
+        let mut reader = Reader::new(bytes);
+        let header = reader.decode::<RecordHeader>()?;
+        let handshake = reader.decode::<QlHandshakeRecord>()?;
+        if header.version != QL_WIRE_VERSION
+            || header.record_type != RecordType::Handshake
+            || !reader.is_empty()
+        {
+            return Err(ql_codec::Error::InvalidData);
+        }
+        Ok((header, handshake))
     }
 
     #[inline]
@@ -335,12 +347,44 @@ pub mod protocol {
 
     #[cfg(test)]
     mod tests {
-        use ql_wire::SessionKey;
+        use ql_wire::{
+            HandshakeId, IkHandshake, QL_WIRE_VERSION, QlHandshakeRecord, RecordHeader, RecordType,
+            RouteHeader, SessionKey, SoftwareCrypto, TransportParams, generate_identity,
+        };
 
         use super::{
-            FRAME_HEADER_SIZE, Frame, PACKET_HEADER_SIZE, PacketKind, open_packet,
-            open_packet_owned, seal_packet,
+            FRAME_HEADER_SIZE, Frame, PACKET_HEADER_SIZE, PacketKind, decode_handshake,
+            open_packet, open_packet_owned, seal_packet,
         };
+
+        #[test]
+        fn handshake_headers_are_validated() {
+            let crypto = SoftwareCrypto;
+            let local = generate_identity(&crypto, "local");
+            let remote = generate_identity(&crypto, "remote");
+            let route = RouteHeader {
+                sender: local.qid,
+                recipient: remote.qid,
+            };
+            let mut handshake = IkHandshake::new_ik_initiator(
+                &crypto,
+                local,
+                remote.bundle(),
+                TransportParams::default(),
+            );
+            let request = handshake.write_1(&crypto, HandshakeId(1)).unwrap();
+            let mut record = ql_wire::encode_record_vec(
+                RecordHeader::new(route, RecordType::Handshake),
+                &QlHandshakeRecord::Ik1(request),
+            );
+            assert!(decode_handshake(&record).is_ok());
+
+            record[0] = QL_WIRE_VERSION.wrapping_add(1);
+            assert!(decode_handshake(&record).is_err());
+            record[0] = QL_WIRE_VERSION;
+            record[RecordHeader::WIRE_SIZE - 1] = RecordType::Session as u8;
+            assert!(decode_handshake(&record).is_err());
+        }
 
         #[test]
         fn packet_authentication_covers_the_entire_frame_and_counter() {

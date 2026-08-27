@@ -11,8 +11,16 @@ peer A                         router                         peer B
   |                              |--- authenticated QL record ->|
 ```
 
-The transport IK handshake authenticates the router against its known peer bundle and derives independent keys for each direction. After the handshake, each length-delimited frame contains a kind, payload, and AES-GCM authentication tag. The frame length, kind, and complete payload are authenticated using an implicit per-direction nonce counter. The encrypted QL body remains opaque to the router and is also authenticated end to end by QL.
+The transport has two phases. The handshake phase exchanges exact, length-delimited QL `Ik1` and `Ik2` records. The secure phase uses this frame:
 
-After connecting, a client attaches a peer bundle and answers a challenge from that identity. The router only accepts records whose sender QID was authenticated on the same connection. A connection may own up to 64 routes.
+```text
+u32-le length | u8 kind | payload | 16-byte AES-GCM tag
+```
+
+The tag authenticates the length, kind, and complete payload. Each direction has an implicit counter used as its nonce; TCP ordering makes packet numbers and replay windows unnecessary. The client proves it derived the transport keys with an empty `Confirm` at counter zero. This permits Desktop Relay to stay connected before it has a Passport identity to attach. Client attachments and records then start at counter one, while router records start at counter zero.
+
+Malformed control messages, invalid tags, unexpected kinds, and counter exhaustion close the connection. Frames are bounded before their bodies are allocated. A local size error does not consume a counter, so the caller may correct it and continue. I/O errors are terminal because a partial TCP write cannot be retried safely.
+
+After connecting, a client attaches a peer bundle and answers a challenge from that identity. The route is published only after the acceptance record is queued. The router only accepts records whose sender QID was authenticated on the same connection. A connection may own up to 64 routes.
 
 TCP carries setup, route attachment, and QL records using length-delimited frames. Each record is limited to 8 KiB. Per-recipient queues are bounded and apply backpressure when a recipient is slower than its senders. Records for missing or disconnected recipients are dropped; QL remains responsible for end-to-end session recovery.
