@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ql_common::{QID, StreamInfo};
+use ql_common::{QID, ResetCode, StreamInfo};
 use ql_fsm::{PeerStatus, ReceiveError};
 use ql_runtime::{
     QlStream,
@@ -64,12 +64,14 @@ impl QlPlatform for Platform {
         self.connection.status(peer, status);
     }
 
-    fn handle_inbound(&self, info: StreamInfo, _: QlStream) {
-        tracing::warn!(
+    fn handle_inbound(&self, info: StreamInfo, mut stream: QlStream) {
+        tracing::debug!(
             qid = %hex::encode(info.qid.0),
-            header_bytes = info.header.len(),
-            "ignoring inbound QL stream"
+            header = %hex::encode(info.header),
+            "rejecting unsupported companion route"
         );
+        stream.reader.reset(ResetCode::UNKNOWN_ROUTE);
+        stream.writer.reset(ResetCode::UNKNOWN_ROUTE);
     }
 
     fn handle_recv_error(&self, error: ReceiveError) {

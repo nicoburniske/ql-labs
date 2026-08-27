@@ -226,9 +226,24 @@ async fn run_connection(
             Step::Command(None) => break,
             Step::Command(Some(Command::Unpair)) => {
                 pairing = None;
+                peer = None;
                 handle.unpair();
+                rx_since_sample = 0;
+                tx_since_sample = 0;
+                states.send_modify(|state| {
+                    state.phase = Phase::Unpaired;
+                    state.peer = None;
+                    state.rx_bytes_per_second = 0;
+                    state.tx_bytes_per_second = 0;
+                });
+                if let Some(bluetooth) = bluetooth.take() {
+                    bluetooth.peripheral.disconnect().await.ok();
+                }
             }
             Step::Command(Some(Command::Peer(value))) => {
+                if pairing.is_none() {
+                    continue;
+                }
                 let display = Peer {
                     name: value.name.clone(),
                     passport_qid: hex::encode(value.qid.0),
@@ -252,6 +267,9 @@ async fn run_connection(
                     continue;
                 }
                 if status == PeerStatus::Disconnected {
+                    if pairing.is_none() && peer.is_none() {
+                        continue;
+                    }
                     states.send_modify(|state| {
                         state.phase = Phase::Failed;
                         state.rx_bytes_per_second = 0;
@@ -260,6 +278,9 @@ async fn run_connection(
                     continue;
                 }
                 if status == PeerStatus::Initiator {
+                    if pairing.is_none() {
+                        continue;
+                    }
                     states.send_modify(|state| state.phase = Phase::SecureSession);
                     continue;
                 }
