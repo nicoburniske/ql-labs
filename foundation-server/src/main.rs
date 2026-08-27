@@ -10,7 +10,10 @@ use figment::{
 };
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
-use ql_router::{DEFAULT_ADDRESS, attach, connect, receive, send};
+use ql_router::{
+    DEFAULT_ADDRESS,
+    tokio::{attach, connect, receive, send},
+};
 use ql_runtime::{RuntimeConfig, RuntimeHandle, new_runtime};
 use ql_wire::{
     PeerBundle, QlHandshakeRecord, QlIdentity, RecordHeader, RecordType, SoftwareCrypto,

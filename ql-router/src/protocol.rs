@@ -107,7 +107,7 @@ pub struct SecureReceiver {
 }
 
 impl SecureReceiver {
-    pub fn new(key: SessionKey, counter: u64) -> Self {
+    fn new(key: SessionKey, counter: u64) -> Self {
         Self {
             key,
             counter: Some(counter),
@@ -168,7 +168,7 @@ pub struct SecureSender {
 }
 
 impl SecureSender {
-    pub fn new(key: SessionKey, counter: u64) -> Self {
+    fn new(key: SessionKey, counter: u64) -> Self {
         Self { key, counter }
     }
 

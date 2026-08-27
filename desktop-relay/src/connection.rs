@@ -473,7 +473,7 @@ async fn run_connection(
                 else {
                     continue;
                 };
-                if record.len() > ql_router::MAX_RECORD_SIZE {
+                if record.len() > ql_router::protocol::MAX_RECORD_SIZE {
                     tracing::warn!(
                         bytes = record.len(),
                         "Passport QL record exceeds router limit"
@@ -561,7 +561,7 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
             }
         };
         let (mut reader, mut writer) =
-            match ql_router::connect(ql_router::DEFAULT_ADDRESS, &router).await {
+            match ql_router::tokio::connect(ql_router::DEFAULT_ADDRESS, &router).await {
                 Ok(connection) => connection,
                 Err(error) => {
                     tracing::warn!(%error, "QL router unavailable");
@@ -573,7 +573,7 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
 
         'connected: loop {
             // keep the frame future alive while outbound messages are handled
-            let mut record = std::pin::pin!(ql_router::receive(&mut reader));
+            let mut record = std::pin::pin!(ql_router::tokio::receive(&mut reader));
             loop {
                 let step = future::race(async { Step::Record(record.as_mut().await) }, async {
                     Step::Outbound(outbound.recv().await)
@@ -594,10 +594,10 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
                     Step::Outbound(Some(message)) => {
                         let result = match message {
                             RouterMessage::Record(record) => {
-                                ql_router::send(&mut writer, &record).await
+                                ql_router::tokio::send(&mut writer, &record).await
                             }
                             RouterMessage::Attach(peer) => {
-                                ql_router::attach(&mut writer, &peer).await
+                                ql_router::tokio::attach(&mut writer, &peer).await
                             }
                         };
                         if let Err(error) = result {

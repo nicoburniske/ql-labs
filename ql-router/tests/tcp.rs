@@ -7,7 +7,10 @@ use std::{
 
 use ql_codec::{Decode, Encode};
 use ql_common::QID;
-use ql_router::{MAX_RECORD_SIZE, Receiver, Sender, attach, connect, receive, send};
+use ql_router::{
+    protocol::MAX_RECORD_SIZE,
+    tokio::{Receiver, Sender, attach, connect, receive, send},
+};
 use ql_wire::{
     PeerBundle, QL_WIRE_VERSION, QlIdentity, RecordHeader, RecordType, RouteHeader, SoftwareCrypto,
     answer_peer_challenge, generate_identity,
