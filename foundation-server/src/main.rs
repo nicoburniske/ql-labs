@@ -144,7 +144,7 @@ async fn handle_inbound(
     let (inbound, inbound_rx) = mpsc::channel(64);
     let platform = Platform::new(sender, outbound.clone(), inbound_rx, peers.clone());
     let mut config = RuntimeConfig::default();
-    config.fsm.session_record_max_size = DEFAULT_UDP_RECORD_SIZE;
+    config.fsm.session.record_max_size = DEFAULT_UDP_RECORD_SIZE;
     let (runtime, handle) = new_runtime(identity.clone(), platform, config);
     inbound.send(record).await.expect("new runtime is alive");
     peers.insert(

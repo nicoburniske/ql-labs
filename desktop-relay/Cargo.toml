@@ -7,11 +7,11 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
-blit = { git = "https://github.com/nicoburniske/blit.git" }
-blit-cpu = { git = "https://github.com/nicoburniske/blit.git" }
-blit-desktop = { git = "https://github.com/nicoburniske/blit.git" }
+blit = { git = "https://github.com/nicoburniske/blit.git", branch = "frame-graph" }
+blit-cpu = { git = "https://github.com/nicoburniske/blit.git", branch = "frame-graph" }
+blit-desktop = { git = "https://github.com/nicoburniske/blit.git", branch = "frame-graph" }
 btleplug = "0.11"
-btp = { git = "https://github.com/Foundation-Devices/foundation-api.git", branch = "ql-v2-shared-api" }
+btp = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
 figment.workspace = true
 fontdb = "0.23"
 futures-lite = "2.6"

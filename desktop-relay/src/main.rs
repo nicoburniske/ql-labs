@@ -3,7 +3,7 @@ mod page;
 mod platform;
 mod theme;
 
-use blit::{Ui, paint::FontId, platform::Platform};
+use blit::{Ui, text::FontId};
 use blit_cpu::{Font, FontFace, RendererConfig};
 use blit_desktop::{Application, Config, EventLoopProxy, Root};
 use figment::{
@@ -64,7 +64,6 @@ fn main() -> anyhow::Result<()> {
 }
 
 struct App {
-    platform: Platform,
     root: Root<App>,
     connection: connection::Connection,
     phase: connection::Phase,
@@ -74,7 +73,7 @@ struct App {
 impl Application for App {
     type Input = ();
 
-    fn new(platform: Platform, _events: EventLoopProxy<Self::Input>, mut root: Root<Self>) -> Self {
+    fn new(_events: EventLoopProxy<Self::Input>, mut root: Root<Self>) -> Self {
         let (connection, mut state) = connection::Connection::new();
         root.spawn(async move |cx| {
             loop {
@@ -87,9 +86,8 @@ impl Application for App {
                 }
             }
         });
-        let page = page::Page::new(platform, &root);
+        let page = page::Page::new(&root);
         Self {
-            platform,
             root,
             connection,
             phase: connection::Phase::Unpaired,

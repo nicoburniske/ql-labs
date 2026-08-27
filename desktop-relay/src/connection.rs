@@ -12,7 +12,7 @@ use futures_lite::{Stream, StreamExt, future};
 use ql_api::{InstallPeerBundlesParams, InstallPeerBundlesResponse, RequestInstallPeerBundles};
 use ql_codec::Decode;
 use ql_common::QID;
-use ql_fsm::{PairingInvite, PeerStatus};
+use ql_fsm::{PairingInvite, PeerStatus, StreamOptions};
 use ql_runtime::{RuntimeConfig, RuntimeHandle, new_runtime};
 use ql_wire::{
     PeerBundle, QL_WIRE_VERSION, RecordHeader, RecordType, SessionCloseCode, SoftwareCrypto,
@@ -294,7 +294,7 @@ async fn run_connection(
                     };
                     match handle
                         .rpc()
-                        .request::<RequestInstallPeerBundles>(&bundles)
+                        .request::<RequestInstallPeerBundles>(&bundles, StreamOptions::default())
                         .await
                     {
                         Ok(InstallPeerBundlesResponse::Installed) => {

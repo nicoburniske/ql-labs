@@ -164,7 +164,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 [[package]]
 name = "blit"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#f8bf72fe7f56be213a8faba038a0f76f25d335c6"
+source = "git+https://github.com/nicoburniske/blit.git?branch=frame-graph#f94894fa37a5d1403507fa454b487295c01f0b58"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -172,7 +172,7 @@ dependencies = [
 [[package]]
 name = "blit-cpu"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#f8bf72fe7f56be213a8faba038a0f76f25d335c6"
+source = "git+https://github.com/nicoburniske/blit.git?branch=frame-graph#f94894fa37a5d1403507fa454b487295c01f0b58"
 dependencies = [
  "blit",
  "blit-font",
@@ -183,7 +183,7 @@ dependencies = [
 [[package]]
 name = "blit-desktop"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#f8bf72fe7f56be213a8faba038a0f76f25d335c6"
+source = "git+https://github.com/nicoburniske/blit.git?branch=frame-graph#f94894fa37a5d1403507fa454b487295c01f0b58"
 dependencies = [
  "blit",
  "blit-cpu",
@@ -195,7 +195,7 @@ dependencies = [
 [[package]]
 name = "blit-executor"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#f8bf72fe7f56be213a8faba038a0f76f25d335c6"
+source = "git+https://github.com/nicoburniske/blit.git?branch=frame-graph#f94894fa37a5d1403507fa454b487295c01f0b58"
 dependencies = [
  "slotmap",
 ]
@@ -203,7 +203,7 @@ dependencies = [
 [[package]]
 name = "blit-font"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#f8bf72fe7f56be213a8faba038a0f76f25d335c6"
+source = "git+https://github.com/nicoburniske/blit.git?branch=frame-graph#f94894fa37a5d1403507fa454b487295c01f0b58"
 dependencies = [
  "blit",
  "ttf-parser",
@@ -213,7 +213,7 @@ dependencies = [
 [[package]]
 name = "blit_cache"
 version = "0.1.0"
-source = "git+https://github.com/nicoburniske/blit.git#f8bf72fe7f56be213a8faba038a0f76f25d335c6"
+source = "git+https://github.com/nicoburniske/blit.git?branch=frame-graph#f94894fa37a5d1403507fa454b487295c01f0b58"
 dependencies = [
  "hashbrown 0.14.5",
 ]
@@ -296,7 +296,7 @@ dependencies = [
 [[package]]
 name = "btp"
 version = "0.1.0"
-source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#a2f088173cecf310019c19286a855d36326cfcb3"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?rev=00f74e6df83cc44642262a0089722b04cdcf963f#00f74e6df83cc44642262a0089722b04cdcf963f"
 dependencies = [
  "bytemuck",
  "consts",
@@ -2258,7 +2258,7 @@ dependencies = [
 [[package]]
 name = "ql-api"
 version = "0.1.0"
-source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#a2f088173cecf310019c19286a855d36326cfcb3"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?rev=00f74e6df83cc44642262a0089722b04cdcf963f#00f74e6df83cc44642262a0089722b04cdcf963f"
 dependencies = [
  "bytes",
  "ciborium",
@@ -2271,6 +2271,7 @@ dependencies = [
 [[package]]
 name = "ql-codec"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?rev=00f74e6df83cc44642262a0089722b04cdcf963f#00f74e6df83cc44642262a0089722b04cdcf963f"
 dependencies = [
  "bytes",
 ]
@@ -2278,7 +2279,7 @@ dependencies = [
 [[package]]
 name = "ql-common"
 version = "0.1.0"
-source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#a2f088173cecf310019c19286a855d36326cfcb3"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?rev=00f74e6df83cc44642262a0089722b04cdcf963f#00f74e6df83cc44642262a0089722b04cdcf963f"
 dependencies = [
  "bytes",
  "ql-codec",
@@ -2287,7 +2288,7 @@ dependencies = [
 [[package]]
 name = "ql-fsm"
 version = "0.1.0"
-source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#a2f088173cecf310019c19286a855d36326cfcb3"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?rev=00f74e6df83cc44642262a0089722b04cdcf963f#00f74e6df83cc44642262a0089722b04cdcf963f"
 dependencies = [
  "bytes",
  "indexmap",
@@ -2299,7 +2300,7 @@ dependencies = [
 [[package]]
 name = "ql-keyos"
 version = "0.1.0"
-source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#a2f088173cecf310019c19286a855d36326cfcb3"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?rev=00f74e6df83cc44642262a0089722b04cdcf963f#00f74e6df83cc44642262a0089722b04cdcf963f"
 dependencies = [
  "bytes",
  "ql-codec",
@@ -2331,7 +2332,7 @@ dependencies = [
 [[package]]
 name = "ql-rpc"
 version = "0.1.0"
-source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#a2f088173cecf310019c19286a855d36326cfcb3"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?rev=00f74e6df83cc44642262a0089722b04cdcf963f#00f74e6df83cc44642262a0089722b04cdcf963f"
 dependencies = [
  "bytes",
  "ql-common",
@@ -2341,7 +2342,7 @@ dependencies = [
 [[package]]
 name = "ql-runtime"
 version = "0.1.0"
-source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#a2f088173cecf310019c19286a855d36326cfcb3"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?rev=00f74e6df83cc44642262a0089722b04cdcf963f#00f74e6df83cc44642262a0089722b04cdcf963f"
 dependencies = [
  "async-channel",
  "bytes",
@@ -2357,7 +2358,7 @@ dependencies = [
 [[package]]
 name = "ql-wire"
 version = "0.1.0"
-source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#a2f088173cecf310019c19286a855d36326cfcb3"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?rev=00f74e6df83cc44642262a0089722b04cdcf963f#00f74e6df83cc44642262a0089722b04cdcf963f"
 dependencies = [
  "bytes",
  "getrandom 0.2.17",
