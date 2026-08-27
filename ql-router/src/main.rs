@@ -87,7 +87,7 @@ struct Connection {
 
 struct Inbound {
     key: SessionKey,
-    next_packet: u64,
+    counter: u64,
     challenge: Option<ActiveChallenge>,
     next_handshake_id: u32,
     routes: HashSet<QID>,
@@ -176,7 +176,7 @@ async fn serve(
         let request = protocol::read_frame(&mut stream)
             .await?
             .ok_or(Error::Protocol)?;
-        negotiate_transport(router, connection, request, &mut stream).await
+        negotiate_transport(router, request, &mut stream).await
     })
     .await
     .map_err(|_| Error::HandshakeTimedOut)??;
@@ -192,7 +192,7 @@ async fn serve(
 
     let mut inbound = Inbound {
         key: rx_key,
-        next_packet: 1,
+        counter: 1,
         challenge: None,
         next_handshake_id: 1,
         routes: HashSet::new(),
@@ -212,19 +212,12 @@ async fn serve(
         Ok(())
     };
     let write = async move {
-        let mut packet_number: u64 = 0;
+        let mut counter: u64 = 0;
         let mut packet = Vec::new();
         while let Some(message) = outbound_rx.recv().await {
-            let number = protocol::next_packet_number(&mut packet_number).ok_or(Error::Protocol)?;
-            protocol::seal_packet_into(
-                &mut packet,
-                &tx_key,
-                PacketKind::Record,
-                connection,
-                number,
-                &message,
-            );
-            protocol::write_frame(&mut writer, &packet).await?;
+            let nonce = protocol::take_counter(&mut counter).ok_or(Error::Protocol)?;
+            protocol::seal_packet_into(&mut packet, &tx_key, PacketKind::Record, nonce, &message)?;
+            protocol::write_packet(&mut writer, &packet).await?;
         }
         Ok(())
     };
@@ -243,14 +236,13 @@ async fn serve(
 
 async fn negotiate_transport(
     router: &'static Router,
-    connection: ConnectionId,
-    request: Vec<u8>,
+    request: protocol::Frame,
     stream: &mut TcpStream,
 ) -> Result<NegotiatedTransport, Error> {
     let (response, tx_key, rx_key) = router
         .handshake(|| {
             let (header, request) =
-                ql_wire::decode_record::<QlHandshakeRecord, _>(request.as_slice())?;
+                ql_wire::decode_record::<QlHandshakeRecord, _>(request.payload())?;
             if header.route.recipient != router.identity.qid
                 || header.record_type != RecordType::Handshake
             {
@@ -268,7 +260,6 @@ async fn negotiate_transport(
             handshake.read_1(&SoftwareCrypto, header.route, &request)?;
             let response = handshake.write_2(&SoftwareCrypto, request.handshake_id)?;
             let response = protocol::TransportResponse {
-                session_id: connection,
                 header: RecordHeader::new(
                     RouteHeader {
                         sender: header.route.recipient,
@@ -283,15 +274,11 @@ async fn negotiate_transport(
         })
         .await?;
 
-    let session_id = response.session_id;
     protocol::write_frame(stream, &response.encode_vec()).await?;
 
     let confirmation = protocol::read_frame(stream).await?.ok_or(Error::Protocol)?;
-    let confirmation = protocol::open_packet(&rx_key, session_id, &confirmation)?;
-    if confirmation.kind != PacketKind::Confirm
-        || confirmation.number != 0
-        || !confirmation.payload.is_empty()
-    {
+    let confirmation = protocol::open_packet(&rx_key, 0, confirmation.as_bytes())?;
+    if confirmation.kind != PacketKind::Confirm || !confirmation.payload.is_empty() {
         return Err(Error::Protocol);
     }
 
@@ -300,15 +287,13 @@ async fn negotiate_transport(
 
 async fn handle_inbound(
     router: &'static Router,
-    packet: Vec<u8>,
+    packet: protocol::Frame,
     connection: ConnectionId,
     outbound: &mpsc::Sender<Vec<u8>>,
     inbound: &mut Inbound,
 ) -> Result<(), Error> {
-    let (kind, number, payload) = protocol::open_packet_owned(&inbound.key, connection, packet)?;
-    if protocol::next_packet_number(&mut inbound.next_packet) != Some(number) {
-        return Err(Error::Protocol);
-    }
+    let nonce = protocol::take_counter(&mut inbound.counter).ok_or(Error::Protocol)?;
+    let (kind, payload) = protocol::open_packet_owned(&inbound.key, nonce, packet)?;
 
     let record = match kind {
         PacketKind::Attach => {
