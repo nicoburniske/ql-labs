@@ -1,4 +1,4 @@
-use std::{collections::HashSet, thread::JoinHandle};
+use std::collections::HashSet;
 
 use async_channel::Receiver;
 use blit::{
@@ -21,44 +21,54 @@ use crate::{connection, theme};
 
 pub struct Page {
     _scope: Scope<Self>,
-    camera: Camera,
+    _camera: Option<Camera>,
+    camera_error: Option<String>,
     preview: Option<ImageHandle>,
-    frame: Option<Box<[u8]>>,
+    frame: Option<CameraFrame>,
     target: Option<connection::Target>,
 }
 
 impl Page {
     pub fn new(mut scope: Scope<Self>) -> Self {
-        let (camera, frames) = start_camera();
-        scope.spawn(async move |cx| {
-            while let Ok(frame) = frames.recv().await {
-                cx.app().set_camera_frame(frame);
-                futures_lite::future::yield_now().await;
+        let (camera, camera_error) = match start_camera() {
+            Ok((camera, frames)) => {
+                scope.spawn(async move |cx| {
+                    while let Ok(frame) = frames.recv().await {
+                        cx.app().set_camera_frame(frame);
+                        futures_lite::future::yield_now().await;
+                    }
+                });
+                (Some(camera), None)
             }
-        });
+            Err(error) => {
+                tracing::error!(%error, "camera unavailable");
+                (None, Some(error.to_string()))
+            }
+        };
         Self {
             _scope: scope,
-            camera,
+            _camera: camera,
+            camera_error,
             preview: None,
             frame: None,
             target: None,
         }
     }
 
-    fn set_camera_frame(&mut self, frame: CameraFrame) {
-        self.frame = Some(frame.luma);
+    fn set_camera_frame(&mut self, mut frame: CameraFrame) {
         if frame.target.is_some() {
-            self.target = frame.target;
+            self.target = frame.target.take();
         }
+        self.frame = Some(frame);
     }
 
     pub fn render(&mut self, ui: &mut Ui) -> Option<connection::Target> {
-        if let Some(luma) = self.frame.take() {
+        if let Some(frame) = self.frame.take() {
             self.preview = Some(ui.create_image(ImageData::new(
-                ImagePixels::Owned(luma),
+                ImagePixels::Owned(frame.luma),
                 ImageFormat::Luma8,
-                self.camera.width,
-                self.camera.height,
+                frame.width,
+                frame.height,
             )));
         }
         let target = self.target.take();
@@ -199,6 +209,13 @@ impl Page {
                                 .width(Sizing::grow())
                                 .height(Sizing::grow()),
                         );
+                    } else if let Some(error) = &self.camera_error {
+                        preview.add(
+                            Text::new(error)
+                                .color(theme::TEXT_MUTED)
+                                .text_size(theme::TEXT_STATUS)
+                                .wrap(TextWrap::Word),
+                        );
                     }
                 });
             });
@@ -209,99 +226,130 @@ impl Page {
 }
 
 struct Camera {
-    thread: Option<JoinHandle<()>>,
-    width: usize,
-    height: usize,
+    pipeline: gstreamer::Pipeline,
 }
 
 struct CameraFrame {
     luma: Box<[u8]>,
+    width: usize,
+    height: usize,
     target: Option<connection::Target>,
 }
 
 impl Drop for Camera {
     fn drop(&mut self) {
-        self.thread.take().unwrap().join().unwrap();
+        use gstreamer::prelude::ElementExt;
+
+        let _ = self.pipeline.set_state(gstreamer::State::Null);
     }
 }
 
-fn start_camera() -> (Camera, Receiver<CameraFrame>) {
-    use v4l::{
-        FourCC,
-        buffer::Type,
-        io::traits::CaptureStream,
-        prelude::{Device, MmapStream},
-        video::Capture,
-    };
-
-    let (device, format) = v4l::context::enum_devices()
-        .into_iter()
-        .map(|node| Device::with_path(node.path()))
-        .filter_map(Result::ok)
-        .filter_map(|device| match device.format() {
-            Ok(format) => Some((device, format)),
-            Err(_) => None,
-        })
-        .find(|(_, format)| {
-            (format.fourcc == FourCC::new(b"YU12") || format.fourcc == FourCC::new(b"NV12"))
-                && (format.stride == 0 || format.stride == format.width)
-        })
-        .unwrap();
-    assert!(format.stride == 0 || format.stride == format.width);
-
-    let mut stream = MmapStream::with_buffers(&device, Type::VideoCapture, 4).unwrap();
-    let width = format.width as usize;
-    let height = format.height as usize;
+fn start_camera() -> anyhow::Result<(Camera, Receiver<CameraFrame>)> {
+    use gstreamer::prelude::{Cast, ElementExt, GstBinExt};
+    gstreamer::init()?;
+    let pipeline = gstreamer::parse::launch(
+        "pipewiresrc ! image/jpeg,width=1280,height=720,framerate=30/1 ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink name=camera max-buffers=1 drop=true sync=false",
+    )?
+    .downcast::<gstreamer::Pipeline>()
+    .map_err(|_| anyhow::anyhow!("camera pipeline is not a pipeline"))?;
+    let sink = pipeline
+        .by_name("camera")
+        .ok_or_else(|| anyhow::anyhow!("camera pipeline has no sink"))?
+        .downcast::<gstreamer_app::AppSink>()
+        .map_err(|_| anyhow::anyhow!("camera sink has the wrong type"))?;
     let (frames, receiver) = async_channel::bounded(2);
-    let thread = std::thread::spawn(move || {
-        const QR_SCAN_EVERY: u64 = 3;
-
-        let mut scanner = MultiFormatReader::default();
-        scanner.set_hints(&DecodeHints {
-            PossibleFormats: Some(HashSet::from([BarcodeFormat::QR_CODE])),
-            TryHarder: Some(true),
-            AlsoInverted: Some(true),
-            ..Default::default()
-        });
-        let mut produced = 0_u64;
-        loop {
-            let (camera_frame, _) = stream.next().unwrap();
-            produced += 1;
-            let luma: Box<[u8]> = camera_frame[..width * height].into();
-            let target = if produced.is_multiple_of(QR_SCAN_EVERY) {
-                let mut scan_frame = luma.to_vec();
-                let minimum = scan_frame.iter().copied().min().unwrap();
-                let maximum = scan_frame.iter().copied().max().unwrap();
-                let threshold = ((minimum as u16 + maximum as u16) / 2) as u8;
-                for pixel in &mut scan_frame {
-                    *pixel = if *pixel >= threshold { 255 } else { 0 };
-                }
-                let mut bitmap = BinaryBitmap::new(HybridBinarizer::new(
-                    Luma8LuminanceSource::new(scan_frame, width as u32, height as u32),
-                ));
-                scanner
-                    .decode_with_state(&mut bitmap)
-                    .ok()
-                    .and_then(|decoded| connection::Target::parse(decoded.getText()))
-            } else {
-                None
-            };
-            let frame = CameraFrame { luma, target };
-            if frame.target.is_some() {
-                let _ = frames.send_blocking(frame);
-                break;
-            }
-            if frames.force_send(frame).is_err() {
-                break;
-            }
-        }
+    let mut scanner = MultiFormatReader::default();
+    scanner.set_hints(&DecodeHints {
+        PossibleFormats: Some(HashSet::from([BarcodeFormat::QR_CODE])),
+        TryHarder: Some(true),
+        AlsoInverted: Some(true),
+        ..Default::default()
     });
-    (
-        Camera {
-            thread: Some(thread),
-            width,
-            height,
-        },
-        receiver,
-    )
+    let mut produced = 0_u64;
+    sink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|error| {
+                    tracing::error!(%error, "reading camera sample failed");
+                    gstreamer::FlowError::Error
+                })?;
+                let info =
+                    gstreamer_video::VideoInfo::from_caps(sample.caps().ok_or_else(|| {
+                        tracing::error!("camera sample has no format");
+                        gstreamer::FlowError::Error
+                    })?)
+                    .map_err(|error| {
+                        tracing::error!(%error, "reading camera format failed");
+                        gstreamer::FlowError::Error
+                    })?;
+                let frame = gstreamer_video::VideoFrame::from_buffer_readable(
+                    sample.buffer_owned().ok_or_else(|| {
+                        tracing::error!("camera sample has no frame");
+                        gstreamer::FlowError::Error
+                    })?,
+                    &info,
+                )
+                .map_err(|_| {
+                    tracing::error!("mapping camera frame failed");
+                    gstreamer::FlowError::Error
+                })?;
+                let width = info.width() as usize;
+                let height = info.height() as usize;
+                let stride = info.stride()[0] as usize;
+                let source = frame.plane_data(0).map_err(|error| {
+                    tracing::error!(%error, "reading camera frame failed");
+                    gstreamer::FlowError::Error
+                })?;
+                let mut luma = vec![0; width * height].into_boxed_slice();
+                for row in 0..height {
+                    luma[row * width..(row + 1) * width]
+                        .copy_from_slice(&source[row * stride..row * stride + width]);
+                }
+
+                produced += 1;
+                if produced == 1 {
+                    tracing::info!(width, height, "camera connected");
+                }
+                let target = if produced.is_multiple_of(3) {
+                    let mut scan_frame = luma.to_vec();
+                    let minimum = scan_frame.iter().copied().min().unwrap();
+                    let maximum = scan_frame.iter().copied().max().unwrap();
+                    let threshold = ((minimum as u16 + maximum as u16) / 2) as u8;
+                    for pixel in &mut scan_frame {
+                        *pixel = if *pixel >= threshold { 255 } else { 0 };
+                    }
+                    let mut bitmap = BinaryBitmap::new(HybridBinarizer::new(
+                        Luma8LuminanceSource::new(scan_frame, width as u32, height as u32),
+                    ));
+                    scanner
+                        .decode_with_state(&mut bitmap)
+                        .ok()
+                        .and_then(|decoded| connection::Target::parse(decoded.getText()))
+                } else {
+                    None
+                };
+                let found = target.is_some();
+                let frame = CameraFrame {
+                    luma,
+                    width,
+                    height,
+                    target,
+                };
+                if found {
+                    frames
+                        .send_blocking(frame)
+                        .map_err(|_| gstreamer::FlowError::Flushing)?;
+                    return Err(gstreamer::FlowError::Eos);
+                }
+                frames
+                    .force_send(frame)
+                    .map_err(|_| gstreamer::FlowError::Flushing)?;
+                Ok(gstreamer::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    pipeline
+        .set_state(gstreamer::State::Playing)
+        .map_err(|_| anyhow::anyhow!("starting camera pipeline failed"))?;
+    Ok((Camera { pipeline }, receiver))
 }
