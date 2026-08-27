@@ -1,7 +1,7 @@
 
 prime <-> foundation-server
 
-prime <-BLE-> desktop/link-app <-TCP/UDP-> ql-router <-TCP/UDP-> foundation-server
+prime <-BLE-> desktop/link-app <-TCP-> ql-router <-TCP-> foundation-server
 
 prime pairing
 
@@ -14,9 +14,6 @@ pair to ql-router
 - open a TCP connection
 - send an IK handshake payload to the router's known identity (TCP) 
 - ok -> both peers get session keys
-
-1200 KB UDP DATAGRAM
-
 
 Cake phone app <-> Passport
 
