@@ -5,30 +5,42 @@ edition.workspace = true
 publish = false
 
 [features]
-default = ["tokio"]
+default = ["server"]
+server = [
+    "tokio",
+    "dep:anyhow",
+    "dep:dashmap",
+    "dep:figment",
+    "dep:futures-lite",
+    "dep:hex",
+    "dep:serde",
+    "dep:socket2",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
 tokio = ["dep:tokio"]
 
 [[bin]]
 name = "ql-router"
 path = "src/main.rs"
-required-features = ["tokio"]
+required-features = ["server"]
 
 [[test]]
 name = "tcp"
-required-features = ["tokio"]
+required-features = ["server"]
 
 [dependencies]
-anyhow.workspace = true
+anyhow = { workspace = true, optional = true }
 bytes = "1"
-dashmap.workspace = true
-figment.workspace = true
-futures-lite = "2.6"
-getrandom = "0.2"
-hex.workspace = true
+dashmap = { workspace = true, optional = true }
+figment = { workspace = true, optional = true }
+futures-lite = { version = "2.6", optional = true }
+hex = { workspace = true, optional = true }
 ql-codec.workspace = true
 ql-common.workspace = true
 ql-wire.workspace = true
-serde.workspace = true
+serde = { workspace = true, optional = true }
+socket2 = { version = "0.6", optional = true }
 tokio = { workspace = true, optional = true }
-tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }

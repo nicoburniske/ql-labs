@@ -15,7 +15,7 @@ ql-api = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev
 ql-codec = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
 ql-common = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
 ql-fsm = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
-ql-router = { path = "ql-router" }
+ql-router = { path = "ql-router", default-features = false, features = ["tokio"] }
 ql-rpc = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
 ql-runtime = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f", features = ["rpc"] }
 ql-wire = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f", features = ["test-utils"] }

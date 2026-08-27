@@ -28,7 +28,7 @@ impl Drop for RouterProcess {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authenticated_tcp_routes_only_attached_senders() {
+async fn authenticated_tcp_routes_and_takeover() {
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -101,6 +101,36 @@ async fn authenticated_tcp_routes_only_attached_senders() {
             .unwrap()
             .unwrap(),
         Some(small)
+    );
+
+    let (mut replacement_rx, mut replacement_tx) = connect(&address, &router).await.unwrap();
+    authenticate(&mut replacement_rx, &mut replacement_tx, &alice, &router).await;
+    let takeover = record(bob.qid, alice.qid, 32);
+    send(&mut bob_tx, &takeover).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), receive(&mut replacement_rx))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(takeover)
+    );
+    assert!(
+        timeout(Duration::from_millis(100), receive(&mut alice_rx))
+            .await
+            .is_err()
+    );
+
+    authenticate(&mut alice_rx, &mut alice_tx, &alice, &router).await;
+    drop((replacement_rx, replacement_tx));
+    sleep(Duration::from_millis(100)).await;
+    let reclaimed = record(bob.qid, alice.qid, 32);
+    send(&mut bob_tx, &reclaimed).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), receive(&mut alice_rx))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some(reclaimed)
     );
 
     let largest = record(

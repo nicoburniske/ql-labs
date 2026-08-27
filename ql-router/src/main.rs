@@ -1,11 +1,9 @@
 use std::{
-    collections::HashSet,
     fmt, fs,
-    io::{self, ErrorKind},
-    os::unix::fs::PermissionsExt,
+    io::{self, ErrorKind, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
     time::Duration,
 };
 
@@ -15,29 +13,34 @@ use figment::{
     providers::{Env, Serialized},
 };
 use futures_lite::future;
-use ql_codec::{Decode, Encode, Reader};
+use ql_codec::{Decode, Encode};
 use ql_common::QID;
 use ql_router::{
     DEFAULT_ADDRESS,
-    protocol::{self, FrameDecoder, PacketKind, SecureReceiver, SecureSender},
+    protocol::{
+        self, FrameDecoder, MAX_ROUTES_PER_CONNECTION, PacketKind, RouterAction, RouterConnection,
+    },
     tokio as router_io,
 };
-use ql_wire::{
-    HandshakeId, PeerBundle, PeerChallenge, QlIdentity, RecordHeader, SoftwareCrypto,
-    generate_identity,
-};
+use ql_wire::{QlIdentity, SoftwareCrypto, generate_identity};
 use serde::{Deserialize, Serialize};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Semaphore, SemaphorePermit, mpsc},
-    time::{Instant, timeout, timeout_at},
+    time::{Instant, sleep, timeout, timeout_at},
 };
-use tracing::{Instrument, Level, debug, debug_span, info};
+use tracing::{Instrument, Level, debug, debug_span, info, warn};
 
-const MAX_ROUTES_PER_CONNECTION: usize = 64;
 const OUTBOUND_QUEUE_SIZE: usize = 4;
 const MAX_PENDING_HANDSHAKES: usize = 1024;
+const MAX_PENDING_TRANSPORTS: usize = 512;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const FRAME_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 type ConnectionId = u64;
 
@@ -47,6 +50,7 @@ struct Config {
     address: String,
     identity_path: PathBuf,
     bundle_path: PathBuf,
+    max_connections: usize,
 }
 
 impl Default for Config {
@@ -56,45 +60,35 @@ impl Default for Config {
             address: DEFAULT_ADDRESS.into(),
             identity_path: "ql-router/identity.bin".into(),
             bundle_path: "ql-router/bundle.bin".into(),
+            max_connections: 16 * 1024,
         }
     }
 }
 
 struct ActiveChallenge {
-    pending: PeerChallenge<&'static QlIdentity>,
     deadline: Instant,
     _admission: SemaphorePermit<'static>,
 }
 
 struct Router {
     identity: QlIdentity,
-    handshake_capacity: Semaphore,
-    challenge_capacity: Semaphore,
-    connections: DashMap<ConnectionId, Arc<Connection>>,
-    routes: DashMap<QID, ConnectionId>,
+    handshake_capacity: Capacity,
+    challenge_capacity: Capacity,
+    connection_capacity: Capacity,
+    transport_capacity: Capacity,
+    routes: DashMap<QID, Route>,
 }
 
 impl Router {
     async fn handshake<T>(&self, work: impl FnOnce() -> T) -> T {
-        let _permit = self.handshake_capacity.acquire().await.unwrap();
+        let _permit = self.handshake_capacity.acquire().await;
         work()
     }
 }
 
-struct Connection {
+struct Route {
+    connection: ConnectionId,
     outbound: mpsc::Sender<Vec<u8>>,
-}
-
-struct Inbound {
-    secure: SecureReceiver,
-    challenge: Option<ActiveChallenge>,
-    next_handshake_id: u32,
-    routes: HashSet<QID>,
-}
-
-struct NegotiatedTransport {
-    outbound: SecureSender,
-    inbound: SecureReceiver,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -102,6 +96,10 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = Figment::from(Serialized::defaults(Config::default()))
         .merge(Env::prefixed("QL_ROUTER_"))
         .extract()?;
+    anyhow::ensure!(
+        (1..=Semaphore::MAX_PERMITS).contains(&config.max_connections),
+        "max connections is out of range"
+    );
     tracing_subscriber::fmt()
         .with_max_level(Level::from_str(&config.log)?)
         .init();
@@ -112,7 +110,12 @@ async fn main() -> anyhow::Result<()> {
         Ok(bytes) => QlIdentity::decode_bytes(bytes.as_slice())?,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             let identity = generate_identity(&SoftwareCrypto, "QL Router");
-            fs::write(&config.identity_path, identity.encode_vec())?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config.identity_path)?
+                .write_all(&identity.encode_vec())?;
             identity
         }
         Err(error) => return Err(error.into()),
@@ -126,42 +129,48 @@ async fn main() -> anyhow::Result<()> {
         .map_or(1, |parallelism| (parallelism.get() / 2).clamp(1, 4));
     let router: &'static Router = Box::leak(Box::new(Router {
         identity,
-        handshake_capacity: Semaphore::new(handshake_workers),
-        challenge_capacity: Semaphore::new(MAX_PENDING_HANDSHAKES),
-        connections: DashMap::new(),
+        handshake_capacity: Capacity::new(handshake_workers),
+        challenge_capacity: Capacity::new(MAX_PENDING_HANDSHAKES),
+        connection_capacity: Capacity::new(config.max_connections),
+        transport_capacity: Capacity::new(MAX_PENDING_TRANSPORTS),
         routes: DashMap::new(),
     }));
     info!(
         workers = handshake_workers,
-        pending = MAX_PENDING_HANDSHAKES,
+        connections = config.max_connections,
+        pending_transports = MAX_PENDING_TRANSPORTS,
+        pending_challenges = MAX_PENDING_HANDSHAKES,
         routes_per_connection = MAX_ROUTES_PER_CONNECTION,
         "QL router limits configured"
     );
     info!(address = %listener.local_addr()?, "QL router listening on");
 
-    run(router, listener).await
-}
-
-async fn run(router: &'static Router, listener: TcpListener) -> anyhow::Result<()> {
+    let mut next_connection: ConnectionId = 1;
     loop {
-        let (stream, remote) = listener.accept().await?;
-        let connection = loop {
-            let mut random = [0; 8];
-            getrandom::getrandom(&mut random).unwrap();
-            let connection = ConnectionId::from_le_bytes(random);
-            if connection != 0 && !router.connections.contains_key(&connection) {
-                break connection;
+        let connection_permit = router.connection_capacity.acquire().await;
+        let transport_permit = router.transport_capacity.acquire().await;
+        let (stream, remote) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(%error, "connection accept failed");
+                sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
             }
         };
+        let connection = next_connection;
+        next_connection = next_connection
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("connection ID exhausted"))?;
         tokio::spawn(
             async move {
+                let _connection_permit = connection_permit;
                 debug!("connection opened");
-                if let Err(error) = serve(router, connection, stream).await {
+                if let Err(error) = serve(router, connection, stream, transport_permit).await {
                     debug!(%error, "connection failed");
                 }
                 debug!("connection closed");
             }
-            .instrument(debug_span!("connection", id = connection, %remote)),
+            .instrument(debug_span!("connection", connection, %remote)),
         );
     }
 }
@@ -170,38 +179,45 @@ async fn serve(
     router: &'static Router,
     connection: ConnectionId,
     mut stream: TcpStream,
+    transport_permit: SemaphorePermit<'static>,
 ) -> Result<(), Error> {
+    stream.set_nodelay(true)?;
+    SockRef::from(&stream).set_tcp_keepalive(
+        &TcpKeepalive::new()
+            .with_time(KEEPALIVE_IDLE)
+            .with_interval(KEEPALIVE_INTERVAL)
+            .with_retries(3),
+    )?;
     let mut frames = FrameDecoder::new();
-    let NegotiatedTransport {
-        outbound: mut secure_outbound,
-        inbound,
-    } = timeout(HANDSHAKE_TIMEOUT, async {
+    let (mut secure_outbound, inbound) = timeout(HANDSHAKE_TIMEOUT, async {
         let request = router_io::read_frame(&mut frames, &mut stream)
             .await?
             .ok_or(Error::Protocol)?;
-        negotiate_transport(router, request, &mut frames, &mut stream).await
+        let (response, mut inbound, outbound) = router
+            .handshake(|| protocol::accept_handshake(&router.identity, &request))
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &response).await?;
+
+        let confirmation = router_io::read_frame(&mut frames, &mut stream)
+            .await?
+            .ok_or(Error::Protocol)?;
+        let (kind, payload) = inbound.open(confirmation)?;
+        if kind != PacketKind::Confirm || !payload.is_empty() {
+            return Err(Error::Protocol);
+        }
+        Ok((outbound, inbound))
     })
     .await
     .map_err(|_| Error::HandshakeTimedOut)??;
+    drop(transport_permit);
     let (mut reader, mut writer) = stream.into_split();
     let (outbound, mut outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_SIZE);
 
-    let connection_state = Arc::new(Connection {
-        outbound: outbound.clone(),
-    });
-    router
-        .connections
-        .insert(connection, connection_state.clone());
-
-    let mut inbound = Inbound {
-        secure: inbound,
-        challenge: None,
-        next_handshake_id: 1,
-        routes: HashSet::new(),
-    };
+    let mut inbound = RouterConnection::new(&router.identity, inbound);
+    let mut challenge: Option<ActiveChallenge> = None;
     let read = async {
         loop {
-            let packet = if let Some(challenge) = inbound.challenge.as_ref() {
+            let packet = if let Some(challenge) = challenge.as_ref() {
                 timeout_at(
                     challenge.deadline,
                     router_io::read_frame(&mut frames, &mut reader),
@@ -209,10 +225,26 @@ async fn serve(
                 .await
                 .map_err(|_| Error::ChallengeTimedOut)??
             } else {
-                router_io::read_frame(&mut frames, &mut reader).await?
+                router_io::read_frame_with_timeout(&mut frames, &mut reader, FRAME_ASSEMBLY_TIMEOUT)
+                    .await?
             };
             let Some(packet) = packet else { break };
-            handle_inbound(router, packet, connection, &outbound, &mut inbound).await?;
+            let deadline = challenge.as_ref().map(|challenge| challenge.deadline);
+            let handled = handle_inbound(
+                router,
+                packet,
+                connection,
+                &outbound,
+                &mut inbound,
+                &mut challenge,
+            );
+            if let Some(deadline) = deadline {
+                timeout_at(deadline, handled)
+                    .await
+                    .map_err(|_| Error::ChallengeTimedOut)??;
+            } else {
+                handled.await?;
+            }
         }
         Ok(())
     };
@@ -220,44 +252,24 @@ async fn serve(
         let mut frame = Vec::new();
         while let Some(message) = outbound_rx.recv().await {
             secure_outbound.seal(&mut frame, PacketKind::Record, &message)?;
-            tokio::io::AsyncWriteExt::write_all(&mut writer, &frame).await?;
+            timeout(
+                WRITE_TIMEOUT,
+                tokio::io::AsyncWriteExt::write_all(&mut writer, &frame),
+            )
+            .await
+            .map_err(|_| Error::WriteTimedOut)??;
         }
         Ok(())
     };
     let result = future::race(read, write).await;
 
-    router.connections.remove_if(&connection, |_, current| {
-        Arc::ptr_eq(current, &connection_state)
-    });
-    for qid in inbound.routes {
+    for qid in inbound.routes() {
+        // a superseded connection must not remove the newer route
         router
             .routes
-            .remove_if(&qid, |_, owner| *owner == connection);
+            .remove_if(&qid, |_, route| route.connection == connection);
     }
     result
-}
-
-async fn negotiate_transport(
-    router: &'static Router,
-    request: protocol::Frame,
-    frames: &mut FrameDecoder,
-    stream: &mut TcpStream,
-) -> Result<NegotiatedTransport, Error> {
-    let (response, mut inbound, outbound) = router
-        .handshake(|| protocol::accept_handshake(&router.identity, &request))
-        .await?;
-
-    tokio::io::AsyncWriteExt::write_all(stream, &response).await?;
-
-    let confirmation = router_io::read_frame(frames, stream)
-        .await?
-        .ok_or(Error::Protocol)?;
-    let (kind, payload) = inbound.open(confirmation)?;
-    if kind != PacketKind::Confirm || !payload.is_empty() {
-        return Err(Error::Protocol);
-    }
-
-    Ok(NegotiatedTransport { outbound, inbound })
 }
 
 async fn handle_inbound(
@@ -265,178 +277,127 @@ async fn handle_inbound(
     packet: protocol::Frame,
     connection: ConnectionId,
     outbound: &mpsc::Sender<Vec<u8>>,
-    inbound: &mut Inbound,
+    inbound: &mut RouterConnection<'static>,
+    challenge: &mut Option<ActiveChallenge>,
 ) -> Result<(), Error> {
-    let (kind, payload) = inbound.secure.open(packet)?;
-
-    let record = match kind {
-        PacketKind::Attach => {
-            if inbound.challenge.is_some() {
-                return Err(Error::ChallengeActive);
-            }
-            if inbound.routes.len() == MAX_ROUTES_PER_CONNECTION {
-                return Err(Error::RouteLimit);
-            }
-            let handshake_id = HandshakeId(inbound.next_handshake_id);
-            inbound.next_handshake_id = inbound
-                .next_handshake_id
-                .checked_add(1)
-                .ok_or(Error::Protocol)?;
+    match inbound.receive(packet)? {
+        RouterAction::Attach(bundle) => {
             let admission = router
                 .challenge_capacity
                 .try_acquire()
-                .map_err(|_| Error::HandshakeOverloaded)?;
-            let (qid, pending, request) = router
-                .handshake(|| -> Result<_, Error> {
-                    let mut payload = Reader::new(payload.as_slice());
-                    let bundle = payload.decode::<PeerBundle>()?;
-                    if !payload.is_empty() {
-                        return Err(Error::Protocol);
-                    }
-                    bundle.validate(&SoftwareCrypto)?;
-                    let qid = bundle.qid;
-                    let (pending, request) = PeerChallenge::new(
-                        &SoftwareCrypto,
-                        &router.identity,
-                        bundle,
-                        handshake_id,
-                    )?;
-                    Ok((qid, pending, request))
-                })
-                .await?;
-            outbound
-                .send(request)
+                .ok_or(Error::HandshakeOverloaded)?;
+            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+            let handshake = router.handshake(|| inbound.begin_challenge(bundle));
+            let (qid, request) = timeout_at(deadline, handshake)
                 .await
-                .map_err(|_| Error::WriterStopped)?;
-            inbound.challenge = Some(ActiveChallenge {
-                pending,
-                deadline: Instant::now() + HANDSHAKE_TIMEOUT,
+                .map_err(|_| Error::ChallengeTimedOut)??;
+            *challenge = Some(ActiveChallenge {
+                deadline,
                 _admission: admission,
             });
+            timeout_at(deadline, outbound.send(request))
+                .await
+                .map_err(|_| Error::ChallengeTimedOut)?
+                .map_err(|_| Error::WriterStopped)?;
             debug!(qid = %hex::encode(qid.0), "challenging QID");
-            return Ok(());
+            Ok(())
         }
-        PacketKind::Record => {
-            if inbound.routes.is_empty() && inbound.challenge.is_none() {
-                return Err(Error::AttachRequired);
-            }
-            payload
+        RouterAction::Authenticate(record) => {
+            let active = challenge.take().ok_or(Error::Protocol)?;
+            let _admission = active._admission;
+            let accepted = router.handshake(|| inbound.verify_route(&record)).await?;
+            outbound
+                .send(accepted)
+                .await
+                .map_err(|_| Error::WriterStopped)?;
+            let qid = inbound.commit_route()?;
+            router.routes.insert(
+                qid,
+                Route {
+                    connection,
+                    outbound: outbound.clone(),
+                },
+            );
+            info!(connection, qid = %hex::encode(qid.0), "authenticated QID");
+            Ok(())
         }
-        _ => return Err(Error::Protocol),
-    };
-    let header = RecordHeader::decode_bytes(record.as_slice())?;
-    if header.route.recipient == router.identity.qid {
-        let challenge = inbound.challenge.take().ok_or(Error::ChallengeMissing)?;
-        let pending = challenge.pending;
-        let _admission = challenge._admission;
-        let (qid, accepted) = router
-            .handshake(|| pending.verify(&SoftwareCrypto, &record))
-            .await?;
-        outbound
-            .send(accepted)
-            .await
-            .map_err(|_| Error::WriterStopped)?;
-        inbound.routes.insert(qid);
-        router.routes.insert(qid, connection);
-        info!(connection, qid = %hex::encode(qid.0), "authenticated QID");
-        return Ok(());
+        RouterAction::Forward {
+            sender,
+            recipient,
+            record,
+        } => {
+            let Some(egress) = router
+                .routes
+                .get(&recipient)
+                .map(|route| route.outbound.clone())
+            else {
+                debug!(
+                    sender = %hex::encode(sender.0),
+                    recipient = %hex::encode(recipient.0),
+                    "no route for recipient"
+                );
+                return Ok(());
+            };
+            let _ = egress.send(record).await;
+            Ok(())
+        }
+        RouterAction::Unauthenticated { sender, recipient } => {
+            debug!(
+                sender = %hex::encode(sender.0),
+                recipient = %hex::encode(recipient.0),
+                "dropping record from unauthenticated sender"
+            );
+            Ok(())
+        }
     }
-
-    route_record(router, record, header, connection).await
 }
 
-async fn route_record(
-    router: &Router,
-    record: Vec<u8>,
-    header: RecordHeader,
-    ingress: ConnectionId,
-) -> Result<(), Error> {
-    if router
-        .routes
-        .get(&header.route.sender)
-        .is_none_or(|owner| *owner != ingress)
-    {
-        debug!(
-            sender = %hex::encode(header.route.sender.0),
-            recipient = %hex::encode(header.route.recipient.0),
-            "dropping record from unauthenticated sender"
-        );
-        return Ok(());
-    }
-    let Some(egress_id) = router
-        .routes
-        .get(&header.route.recipient)
-        .map(|owner| *owner)
-    else {
-        debug!(
-            sender = %hex::encode(header.route.sender.0),
-            recipient = %hex::encode(header.route.recipient.0),
-            "no route for recipient"
-        );
-        return Ok(());
-    };
-    let Some(egress) = router
-        .connections
-        .get(&egress_id)
-        .map(|connection| connection.clone())
-    else {
-        return Ok(());
-    };
-
-    let _ = egress.outbound.send(record).await;
-    Ok(())
-}
-
-#[repr(usize)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum Error {
-    Io,
-    Codec,
-    Wire,
-    AttachRequired,
-    ChallengeActive,
-    ChallengeMissing,
+    Io(io::Error),
     ChallengeTimedOut,
     HandshakeTimedOut,
-    RouteLimit,
     HandshakeOverloaded,
     WriterStopped,
+    WriteTimedOut,
     Protocol,
 }
 
 impl From<io::Error> for Error {
-    fn from(_: io::Error) -> Self {
-        Self::Io
-    }
-}
-
-impl From<ql_codec::Error> for Error {
-    fn from(_: ql_codec::Error) -> Self {
-        Self::Codec
-    }
-}
-
-impl From<ql_wire::Error> for Error {
-    fn from(_: ql_wire::Error) -> Self {
-        Self::Wire
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io => f.write_str("I/O error"),
-            Self::Codec => f.write_str("codec error"),
-            Self::Wire => f.write_str("wire error"),
-            Self::AttachRequired => f.write_str("peer must attach before routing records"),
-            Self::ChallengeActive => f.write_str("route challenge already active"),
-            Self::ChallengeMissing => f.write_str("no active route challenge"),
+            Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::ChallengeTimedOut => f.write_str("route challenge timed out"),
             Self::HandshakeTimedOut => f.write_str("transport handshake timed out"),
-            Self::RouteLimit => f.write_str("connection route limit reached"),
             Self::HandshakeOverloaded => f.write_str("handshake capacity exhausted"),
             Self::WriterStopped => f.write_str("connection writer stopped"),
+            Self::WriteTimedOut => f.write_str("connection write timed out"),
             Self::Protocol => f.write_str("transport protocol error"),
         }
+    }
+}
+
+struct Capacity(Semaphore);
+
+impl Capacity {
+    fn new(permits: usize) -> Self {
+        Self(Semaphore::new(permits))
+    }
+
+    async fn acquire(&self) -> SemaphorePermit<'_> {
+        match self.0.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => unreachable!("capacity semaphore cannot be closed"),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<SemaphorePermit<'_>> {
+        self.0.try_acquire().ok()
     }
 }
