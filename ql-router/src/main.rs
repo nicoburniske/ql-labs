@@ -19,11 +19,11 @@ use ql_codec::{Decode, Encode, Reader};
 use ql_common::QID;
 use ql_router::{
     DEFAULT_ADDRESS,
-    protocol::{self, PacketKind},
+    protocol::{self, FrameDecoder, PacketKind, SecureReceiver, SecureSender},
+    tokio as router_io,
 };
 use ql_wire::{
-    HandshakeId, IkHandshake, PeerBundle, PeerChallenge, QlHandshakeRecord, QlIdentity,
-    RecordHeader, RecordType, RouteHeader, SessionKey, SoftwareCrypto, TransportParams,
+    HandshakeId, PeerBundle, PeerChallenge, QlIdentity, RecordHeader, SoftwareCrypto,
     generate_identity,
 };
 use serde::{Deserialize, Serialize};
@@ -86,16 +86,15 @@ struct Connection {
 }
 
 struct Inbound {
-    key: SessionKey,
-    counter: u64,
+    secure: SecureReceiver,
     challenge: Option<ActiveChallenge>,
     next_handshake_id: u32,
     routes: HashSet<QID>,
 }
 
 struct NegotiatedTransport {
-    tx_key: SessionKey,
-    rx_key: SessionKey,
+    outbound: SecureSender,
+    inbound: SecureReceiver,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -172,11 +171,15 @@ async fn serve(
     connection: ConnectionId,
     mut stream: TcpStream,
 ) -> Result<(), Error> {
-    let NegotiatedTransport { tx_key, rx_key } = timeout(HANDSHAKE_TIMEOUT, async {
-        let request = protocol::read_frame(&mut stream)
+    let mut frames = FrameDecoder::new();
+    let NegotiatedTransport {
+        outbound: mut secure_outbound,
+        inbound,
+    } = timeout(HANDSHAKE_TIMEOUT, async {
+        let request = router_io::read_frame(&mut frames, &mut stream)
             .await?
             .ok_or(Error::Protocol)?;
-        negotiate_transport(router, request, &mut stream).await
+        negotiate_transport(router, request, &mut frames, &mut stream).await
     })
     .await
     .map_err(|_| Error::HandshakeTimedOut)??;
@@ -191,8 +194,7 @@ async fn serve(
         .insert(connection, connection_state.clone());
 
     let mut inbound = Inbound {
-        key: rx_key,
-        counter: 1,
+        secure: inbound,
         challenge: None,
         next_handshake_id: 1,
         routes: HashSet::new(),
@@ -200,11 +202,14 @@ async fn serve(
     let read = async {
         loop {
             let packet = if let Some(challenge) = inbound.challenge.as_ref() {
-                timeout_at(challenge.deadline, protocol::read_frame(&mut reader))
-                    .await
-                    .map_err(|_| Error::ChallengeTimedOut)??
+                timeout_at(
+                    challenge.deadline,
+                    router_io::read_frame(&mut frames, &mut reader),
+                )
+                .await
+                .map_err(|_| Error::ChallengeTimedOut)??
             } else {
-                protocol::read_frame(&mut reader).await?
+                router_io::read_frame(&mut frames, &mut reader).await?
             };
             let Some(packet) = packet else { break };
             handle_inbound(router, packet, connection, &outbound, &mut inbound).await?;
@@ -212,12 +217,10 @@ async fn serve(
         Ok(())
     };
     let write = async move {
-        let mut counter: u64 = 0;
-        let mut packet = Vec::new();
+        let mut frame = Vec::new();
         while let Some(message) = outbound_rx.recv().await {
-            let nonce = protocol::take_counter(&mut counter).ok_or(Error::Protocol)?;
-            protocol::seal_packet_into(&mut packet, &tx_key, PacketKind::Record, nonce, &message)?;
-            protocol::write_packet(&mut writer, &packet).await?;
+            secure_outbound.seal(&mut frame, PacketKind::Record, &message)?;
+            tokio::io::AsyncWriteExt::write_all(&mut writer, &frame).await?;
         }
         Ok(())
     };
@@ -237,49 +240,24 @@ async fn serve(
 async fn negotiate_transport(
     router: &'static Router,
     request: protocol::Frame,
+    frames: &mut FrameDecoder,
     stream: &mut TcpStream,
 ) -> Result<NegotiatedTransport, Error> {
-    let (response, tx_key, rx_key) = router
-        .handshake(|| {
-            let (header, request) = protocol::decode_handshake(request.payload())?;
-            if header.route.recipient != router.identity.qid {
-                return Err(Error::Protocol);
-            }
-            let QlHandshakeRecord::Ik1(request) = request else {
-                return Err(Error::Protocol);
-            };
-            let mut handshake = IkHandshake::new_ik_responder(
-                &SoftwareCrypto,
-                &router.identity,
-                None,
-                TransportParams::default(),
-            );
-            handshake.read_1(&SoftwareCrypto, header.route, &request)?;
-            let response = handshake.write_2(&SoftwareCrypto, request.handshake_id)?;
-            let response = ql_wire::encode_record_vec(
-                RecordHeader::new(
-                    RouteHeader {
-                        sender: header.route.recipient,
-                        recipient: header.route.sender,
-                    },
-                    RecordType::Handshake,
-                ),
-                &QlHandshakeRecord::Ik2(response),
-            );
-            let finalized = handshake.finalize(&SoftwareCrypto)?;
-            Ok((response, finalized.tx_key, finalized.rx_key))
-        })
+    let (response, mut inbound, outbound) = router
+        .handshake(|| protocol::accept_handshake(&router.identity, &request))
         .await?;
 
-    protocol::write_frame(stream, &response).await?;
+    tokio::io::AsyncWriteExt::write_all(stream, &response).await?;
 
-    let confirmation = protocol::read_frame(stream).await?.ok_or(Error::Protocol)?;
-    let confirmation = protocol::open_packet(&rx_key, 0, confirmation.as_bytes())?;
-    if confirmation.kind != PacketKind::Confirm || !confirmation.payload.is_empty() {
+    let confirmation = router_io::read_frame(frames, stream)
+        .await?
+        .ok_or(Error::Protocol)?;
+    let (kind, payload) = inbound.open(confirmation)?;
+    if kind != PacketKind::Confirm || !payload.is_empty() {
         return Err(Error::Protocol);
     }
 
-    Ok(NegotiatedTransport { tx_key, rx_key })
+    Ok(NegotiatedTransport { outbound, inbound })
 }
 
 async fn handle_inbound(
@@ -289,8 +267,7 @@ async fn handle_inbound(
     outbound: &mpsc::Sender<Vec<u8>>,
     inbound: &mut Inbound,
 ) -> Result<(), Error> {
-    let nonce = protocol::take_counter(&mut inbound.counter).ok_or(Error::Protocol)?;
-    let (kind, payload) = protocol::open_packet_owned(&inbound.key, nonce, packet)?;
+    let (kind, payload) = inbound.secure.open(packet)?;
 
     let record = match kind {
         PacketKind::Attach => {

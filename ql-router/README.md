@@ -21,6 +21,8 @@ The tag authenticates the length, kind, and complete payload. Each direction has
 
 Malformed control messages, invalid tags, unexpected kinds, and counter exhaustion close the connection. Frames are bounded before their bodies are allocated. A local size error does not consume a counter, so the caller may correct it and continue. I/O errors are terminal because a partial TCP write cannot be retried safely.
 
+The `protocol` module is synchronous and runtime-independent. It owns handshake transitions, incremental frame assembly, authentication, nonce state, and the per-connection attach and routing state machine. Callers feed socket reads into `FrameDecoder::buffer` and report their length with `FrameDecoder::advance`; partial state survives cancellation in an outer runtime. `RouterConnection` emits attach, authentication, forwarding, and rejection actions for any outer server implementation. The optional `tokio` feature provides the existing async client and socket adapter.
+
 After connecting, a client attaches a peer bundle and answers a challenge from that identity. The route is published only after the acceptance record is queued. The router only accepts records whose sender QID was authenticated on the same connection. A connection may own up to 64 routes.
 
 TCP carries setup, route attachment, and QL records using length-delimited frames. Each record is limited to 8 KiB. Per-recipient queues are bounded and apply backpressure when a recipient is slower than its senders. Records for missing or disconnected recipients are dropped; QL remains responsible for end-to-end session recovery.

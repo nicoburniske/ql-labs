@@ -4,6 +4,19 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio"]
+
+[[bin]]
+name = "ql-router"
+path = "src/main.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "tcp"
+required-features = ["tokio"]
+
 [dependencies]
 anyhow.workspace = true
 bytes = "1"
@@ -16,6 +29,6 @@ ql-codec.workspace = true
 ql-common.workspace = true
 ql-wire.workspace = true
 serde.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
