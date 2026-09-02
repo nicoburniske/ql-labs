@@ -11,7 +11,7 @@ blit = { git = "https://github.com/nicoburniske/blit.git", branch = "frame-graph
 blit-cpu = { git = "https://github.com/nicoburniske/blit.git", branch = "frame-graph" }
 blit-desktop = { git = "https://github.com/nicoburniske/blit.git", branch = "frame-graph" }
 btleplug = "0.11"
-btp = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
+btp = { path = "../../foundation-api/btp" }
 figment.workspace = true
 fontdb = "0.23"
 futures-lite = "2.6"
@@ -23,7 +23,7 @@ ql-api.workspace = true
 ql-codec.workspace = true
 ql-common.workspace = true
 ql-fsm.workspace = true
-ql-router.workspace = true
+ql-relay.workspace = true
 ql-runtime.workspace = true
 ql-wire.workspace = true
 rxing = { version = "0.9.1", default-features = false, features = ["decoders", "encoding_rs", "qrcode"] }

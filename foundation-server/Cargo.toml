@@ -13,9 +13,9 @@ ql-api.workspace = true
 ql-codec.workspace = true
 ql-common.workspace = true
 ql-fsm.workspace = true
-ql-keyos = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
+ql-keyos = { path = "../../foundation-api/ql-keyos" }
 ql-rpc.workspace = true
-ql-router.workspace = true
+ql-relay.workspace = true
 ql-runtime = { workspace = true, features = ["rpc"] }
 ql-wire.workspace = true
 serde.workspace = true
