@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fmt, fs,
     io::{self, ErrorKind},
     os::unix::fs::PermissionsExt,
@@ -29,7 +28,10 @@ use ql_wire::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{Semaphore, SemaphorePermit, mpsc},
+    sync::{
+        Semaphore, SemaphorePermit,
+        mpsc::{self, error::TrySendError},
+    },
     time::{Instant, timeout, timeout_at},
 };
 use tracing::{Instrument, Level, debug, debug_span, info};
@@ -38,6 +40,8 @@ const MAX_ROUTES_PER_CONNECTION: usize = 64;
 const OUTBOUND_QUEUE_SIZE: usize = 4;
 const MAX_PENDING_HANDSHAKES: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const FIRST_ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 
 type ConnectionId = u64;
 
@@ -45,6 +49,7 @@ type ConnectionId = u64;
 struct Config {
     log: String,
     address: String,
+    max_connections: usize,
     identity_path: PathBuf,
     bundle_path: PathBuf,
 }
@@ -54,6 +59,7 @@ impl Default for Config {
         Self {
             log: "INFO".into(),
             address: DEFAULT_ADDRESS.into(),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             identity_path: "ql-router/identity.bin".into(),
             bundle_path: "ql-router/bundle.bin".into(),
         }
@@ -70,6 +76,7 @@ struct Router {
     identity: QlIdentity,
     handshake_capacity: Semaphore,
     challenge_capacity: Semaphore,
+    connection_capacity: Semaphore,
     connections: DashMap<ConnectionId, Arc<Connection>>,
     routes: DashMap<QID, ConnectionId>,
 }
@@ -90,7 +97,7 @@ struct Inbound {
     counter: u64,
     challenge: Option<ActiveChallenge>,
     next_handshake_id: u32,
-    routes: HashSet<QID>,
+    routes: Vec<QID>,
 }
 
 struct NegotiatedTransport {
@@ -129,12 +136,14 @@ async fn main() -> anyhow::Result<()> {
         identity,
         handshake_capacity: Semaphore::new(handshake_workers),
         challenge_capacity: Semaphore::new(MAX_PENDING_HANDSHAKES),
+        connection_capacity: Semaphore::new(config.max_connections),
         connections: DashMap::new(),
         routes: DashMap::new(),
     }));
     info!(
         workers = handshake_workers,
         pending = MAX_PENDING_HANDSHAKES,
+        connections = config.max_connections,
         routes_per_connection = MAX_ROUTES_PER_CONNECTION,
         "QL router limits configured"
     );
@@ -146,6 +155,10 @@ async fn main() -> anyhow::Result<()> {
 async fn run(router: &'static Router, listener: TcpListener) -> anyhow::Result<()> {
     loop {
         let (stream, remote) = listener.accept().await?;
+        let Ok(admission) = router.connection_capacity.try_acquire() else {
+            debug!(%remote, "rejecting connection because capacity is exhausted");
+            continue;
+        };
         let connection = loop {
             let mut random = [0; 8];
             getrandom::getrandom(&mut random).unwrap();
@@ -156,6 +169,7 @@ async fn run(router: &'static Router, listener: TcpListener) -> anyhow::Result<(
         };
         tokio::spawn(
             async move {
+                let _admission = admission;
                 debug!("connection opened");
                 if let Err(error) = serve(router, connection, stream).await {
                     debug!(%error, "connection failed");
@@ -195,11 +209,22 @@ async fn serve(
         counter: 1,
         challenge: None,
         next_handshake_id: 1,
-        routes: HashSet::new(),
+        routes: Vec::new(),
     };
+    let first_attach_deadline = Instant::now() + FIRST_ATTACH_TIMEOUT;
     let read = async {
         loop {
-            let packet = if let Some(challenge) = inbound.challenge.as_ref() {
+            let packet = if inbound.routes.is_empty() {
+                let deadline = inbound
+                    .challenge
+                    .as_ref()
+                    .map_or(first_attach_deadline, |challenge| {
+                        first_attach_deadline.min(challenge.deadline)
+                    });
+                timeout_at(deadline, protocol::read_frame(&mut reader))
+                    .await
+                    .map_err(|_| Error::AttachTimedOut)??
+            } else if let Some(challenge) = inbound.challenge.as_ref() {
                 timeout_at(challenge.deadline, protocol::read_frame(&mut reader))
                     .await
                     .map_err(|_| Error::ChallengeTimedOut)??
@@ -326,10 +351,7 @@ async fn handle_inbound(
                     Ok((qid, pending, request))
                 })
                 .await?;
-            outbound
-                .send(request)
-                .await
-                .map_err(|_| Error::WriterStopped)?;
+            outbound.try_send(request)?;
             inbound.challenge = Some(ActiveChallenge {
                 pending,
                 deadline: Instant::now() + HANDSHAKE_TIMEOUT,
@@ -354,20 +376,19 @@ async fn handle_inbound(
         let (qid, accepted) = router
             .handshake(|| pending.verify(&SoftwareCrypto, &record))
             .await?;
-        inbound.routes.insert(qid);
+        outbound.try_send(accepted)?;
+        if !inbound.routes.contains(&qid) {
+            inbound.routes.push(qid);
+        }
         router.routes.insert(qid, connection);
-        outbound
-            .send(accepted)
-            .await
-            .map_err(|_| Error::WriterStopped)?;
         info!(connection, qid = %hex::encode(qid.0), "authenticated QID");
         return Ok(());
     }
 
-    route_record(router, record, header, connection).await
+    route_record(router, record, header, connection)
 }
 
-async fn route_record(
+fn route_record(
     router: &Router,
     record: Vec<u8>,
     header: RecordHeader,
@@ -405,7 +426,21 @@ async fn route_record(
         return Ok(());
     };
 
-    let _ = egress.outbound.send(record).await;
+    match egress.outbound.try_send(record) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            debug!(
+                recipient = %hex::encode(header.route.recipient.0),
+                "dropping record because recipient queue is full"
+            );
+        }
+        Err(TrySendError::Closed(_)) => {
+            debug!(
+                recipient = %hex::encode(header.route.recipient.0),
+                "dropping record because recipient connection closed"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -416,12 +451,14 @@ enum Error {
     Codec,
     Wire,
     AttachRequired,
+    AttachTimedOut,
     ChallengeActive,
     ChallengeMissing,
     ChallengeTimedOut,
     HandshakeTimedOut,
     RouteLimit,
     HandshakeOverloaded,
+    OutboundFull,
     WriterStopped,
     Protocol,
 }
@@ -444,6 +481,15 @@ impl From<ql_wire::Error> for Error {
     }
 }
 
+impl From<TrySendError<Vec<u8>>> for Error {
+    fn from(error: TrySendError<Vec<u8>>) -> Self {
+        match error {
+            TrySendError::Full(_) => Self::OutboundFull,
+            TrySendError::Closed(_) => Self::WriterStopped,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -451,12 +497,14 @@ impl fmt::Display for Error {
             Self::Codec => f.write_str("codec error"),
             Self::Wire => f.write_str("wire error"),
             Self::AttachRequired => f.write_str("peer must attach before routing records"),
+            Self::AttachTimedOut => f.write_str("first peer attachment timed out"),
             Self::ChallengeActive => f.write_str("route challenge already active"),
             Self::ChallengeMissing => f.write_str("no active route challenge"),
             Self::ChallengeTimedOut => f.write_str("route challenge timed out"),
             Self::HandshakeTimedOut => f.write_str("transport handshake timed out"),
             Self::RouteLimit => f.write_str("connection route limit reached"),
             Self::HandshakeOverloaded => f.write_str("handshake capacity exhausted"),
+            Self::OutboundFull => f.write_str("connection outbound queue is full"),
             Self::WriterStopped => f.write_str("connection writer stopped"),
             Self::Protocol => f.write_str("transport protocol error"),
         }
