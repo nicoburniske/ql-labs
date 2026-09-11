@@ -2603,6 +2603,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "relay-ping-pong"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "hex",
+ "ql-codec",
+ "ql-common",
+ "ql-fsm",
+ "ql-relay",
+ "ql-rpc",
+ "ql-runtime",
+ "ql-wire",
+ "tokio",
+]
+
+[[package]]
 name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
