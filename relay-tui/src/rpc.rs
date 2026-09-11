@@ -14,7 +14,13 @@ use tokio::sync::watch;
 
 #[derive(Clone)]
 pub struct Service {
-    pub activity: watch::Sender<String>,
+    pub activity: watch::Sender<Activity>,
+}
+
+#[derive(Clone, Default)]
+pub struct Activity {
+    pub echo: String,
+    pub download: String,
 }
 
 impl RequestHandler<RequestEcho, QlStream> for Service {
@@ -25,14 +31,15 @@ impl RequestHandler<RequestEcho, QlStream> for Service {
         response: Response<EchoResponse, StreamWriter>,
     ) {
         self.activity
-            .send_replace(format!("Prime echo: {}", request.message));
+            .send_modify(|activity| activity.echo = format!("In: {}", request.message));
         if let Err(error) = response
             .respond(EchoResponse {
                 message: request.message,
             })
             .await
         {
-            self.activity.send_replace(format!("echo failed: {error}"));
+            self.activity
+                .send_modify(|activity| activity.echo = format!("In: {error}"));
         }
     }
 }
@@ -75,9 +82,11 @@ impl DownloadHandler<DownloadBenchmark, QlStream> for Service {
             writer.finish().await
         }
         .await;
-        self.activity.send_replace(match result {
-            Ok(()) => format!("served {length} bytes to Prime"),
-            Err(error) => format!("download failed: {error}"),
+        self.activity.send_modify(|activity| {
+            activity.download = match result {
+                Ok(()) => format!("served {length} bytes to Prime"),
+                Err(error) => format!("download failed: {error}"),
+            }
         });
     }
 }

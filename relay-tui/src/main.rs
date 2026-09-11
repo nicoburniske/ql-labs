@@ -48,8 +48,9 @@ struct App {
     echo_input: text_input::State,
     download_size: String,
     download_input: text_input::State,
-    result: String,
-    activity: String,
+    echo_result: String,
+    download_result: String,
+    activity: rpc::Activity,
     busy: bool,
     permitted: bool,
 }
@@ -137,7 +138,7 @@ fn main() -> anyhow::Result<()> {
     let mut root = unsafe { executor.as_ref().root() };
     let (status, mut statuses) = watch::channel(PeerStatus::Disconnected);
     let (peer, mut peers) = watch::channel(None);
-    let (activity, mut activities) = watch::channel(String::new());
+    let (activity, mut activities) = watch::channel(rpc::Activity::default());
     let (outbound, mut outgoing) = mpsc::channel(16);
     let (incoming, inbound) = mpsc::channel(16);
     let platform = platform::Platform {
@@ -162,8 +163,9 @@ fn main() -> anyhow::Result<()> {
         echo_input: Default::default(),
         download_size: "256".into(),
         download_input: Default::default(),
-        result: String::new(),
-        activity: String::new(),
+        echo_result: String::new(),
+        download_result: String::new(),
+        activity: rpc::Activity::default(),
         busy: false,
         permitted: false,
     };
@@ -190,7 +192,7 @@ fn main() -> anyhow::Result<()> {
                     .await;
                 match result {
                     Ok(ql_api::PeerPermissionsResponse::Updated) => cx.app().permitted = true,
-                    _ => cx.app().result = "Prime did not grant debug RPC permission".into(),
+                    _ => cx.app().echo_result = "Debug permission denied".into(),
                 }
             }
         }
@@ -403,7 +405,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     {
                         let mut echo = controls
-                            .child(flex::item().height(Sizing::fixed(5.0)))
+                            .child(flex::item().height(Sizing::fixed(9.0)))
                             .layout(flex::column().padding(Sides::all(1.0)));
                         echo.insert(panel(" ECHO "));
                         let mut row = echo
@@ -415,10 +417,18 @@ fn main() -> anyhow::Result<()> {
                         send |= row
                             .child(flex::item().fixed(12.0, 1.0))
                             .build(|ui: Ui<'_>| button(ui, "echo", "Send", enabled));
+                        drop(row);
+                        for text in [&app.echo_result, &app.activity.echo] {
+                            echo.child(flex::item().height(Sizing::fixed(2.0))).insert(
+                                Text::new(text)
+                                    .color(Color::WHITE)
+                                    .options(TextOptions::new().wrap(TextWrap::Word)),
+                            );
+                        }
                     }
                     {
                         let mut transfer = controls
-                            .child(flex::item().height(Sizing::fixed(5.0)))
+                            .child(flex::item().height(Sizing::fixed(7.0)))
                             .layout(flex::column().padding(Sides::all(1.0)));
                         transfer.insert(panel(" DOWNLOAD "));
                         let mut row = transfer
@@ -437,23 +447,13 @@ fn main() -> anyhow::Result<()> {
                         download |= row
                             .child(flex::item().fixed(12.0, 1.0))
                             .build(|ui: Ui<'_>| button(ui, "download", "Download", enabled));
+                        drop(row);
+                        for text in [&app.download_result, &app.activity.download] {
+                            transfer
+                                .child(flex::item().height(Sizing::fixed(1.0)))
+                                .insert(Text::new(text).color(Color::WHITE));
+                        }
                     }
-                    controls
-                        .child(flex::item().height(Sizing::fixed(2.0)))
-                        .insert(
-                            Text::new(&app.result)
-                                .color(if app.busy {
-                                    Color::YELLOW
-                                } else {
-                                    Color::WHITE
-                                })
-                                .options(TextOptions::new().wrap(TextWrap::Word)),
-                        );
-                    controls.child(flex::item().grow()).insert(
-                        Text::new(&app.activity)
-                            .color(Color::GRAY)
-                            .options(TextOptions::new().wrap(TextWrap::Word)),
-                    );
                 }
             },
         );
@@ -462,15 +462,15 @@ fn main() -> anyhow::Result<()> {
             let message = app.echo.clone();
             let download_size = app.download_size.clone();
             app.busy = true;
-            app.result = if download {
-                "Downloading..."
+            if download {
+                app.download_result = "Downloading...".into();
             } else {
-                "Sending echo..."
+                app.echo_result = "Sending...".into();
             }
-            .into();
             root.spawn(async move |cx| {
                 let result: anyhow::Result<String> = async {
                     if !download {
+                        let started = Instant::now();
                         let reply = handle
                             .rpc()
                             .request::<RequestPassportEcho>(
@@ -478,7 +478,11 @@ fn main() -> anyhow::Result<()> {
                                 StreamOptions::default(),
                             )
                             .await?;
-                        return Ok(format!("echo: {}", reply.message));
+                        return Ok(format!(
+                            "Reply · {:.1} ms: {}",
+                            started.elapsed().as_secs_f64() * 1000.0,
+                            reply.message
+                        ));
                     }
                     let length = download_size
                         .trim()
@@ -497,6 +501,9 @@ fn main() -> anyhow::Result<()> {
                         )
                         .await?;
                     let (header, mut parts) = download.start().await?;
+                    let started = Instant::now();
+                    let mut last_update = started;
+                    let mut last_bytes = 0;
                     let mut hash = Sha256::new();
                     let mut total = 0;
                     while let Some((_, mut part)) = parts.next_part().await? {
@@ -508,6 +515,20 @@ fn main() -> anyhow::Result<()> {
                             total += chunk.len() as u64;
                             ensure!(total <= length, "download exceeds requested length");
                             hash.update(&chunk);
+                            let now = Instant::now();
+                            let interval = now.duration_since(last_update);
+                            if interval >= Duration::from_millis(250) || total == length {
+                                let rate = (total - last_bytes) as f64
+                                    / interval.as_secs_f64().max(f64::EPSILON)
+                                    / 1024.0;
+                                cx.app().download_result = format!(
+                                    "{:.1}/{:.1} KiB · {rate:.1} KiB/s",
+                                    total as f64 / 1024.0,
+                                    length as f64 / 1024.0,
+                                );
+                                last_update = now;
+                                last_bytes = total;
+                            }
                         }
                     }
                     parts.complete().await?;
@@ -516,14 +537,24 @@ fn main() -> anyhow::Result<()> {
                         header.hash == hash.finalize().as_slice(),
                         "download hash mismatch"
                     );
-                    Ok(format!("download: verified {total} bytes (SHA-256)"))
+                    let rate =
+                        total as f64 / started.elapsed().as_secs_f64().max(f64::EPSILON) / 1024.0;
+                    Ok(format!(
+                        "{:.1} KiB · {rate:.1} KiB/s avg · verified",
+                        total as f64 / 1024.0,
+                    ))
                 }
                 .await;
                 let mut app = cx.app();
-                app.result = match result {
+                let message = match result {
                     Ok(message) => message,
                     Err(error) => format!("failed: {error:#}"),
                 };
+                if download {
+                    app.download_result = message;
+                } else {
+                    app.echo_result = message;
+                }
                 app.busy = false;
             });
         }
