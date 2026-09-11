@@ -226,9 +226,24 @@ async fn run_connection(
             Step::Command(None) => break,
             Step::Command(Some(Command::Unpair)) => {
                 pairing = None;
+                peer = None;
                 handle.unpair();
+                rx_since_sample = 0;
+                tx_since_sample = 0;
+                states.send_modify(|state| {
+                    state.phase = Phase::Unpaired;
+                    state.peer = None;
+                    state.rx_bytes_per_second = 0;
+                    state.tx_bytes_per_second = 0;
+                });
+                if let Some(bluetooth) = bluetooth.take() {
+                    bluetooth.peripheral.disconnect().await.ok();
+                }
             }
             Step::Command(Some(Command::Peer(value))) => {
+                if pairing.is_none() {
+                    continue;
+                }
                 let display = Peer {
                     name: value.name.clone(),
                     passport_qid: hex::encode(value.qid.0),
@@ -252,6 +267,9 @@ async fn run_connection(
                     continue;
                 }
                 if status == PeerStatus::Disconnected {
+                    if pairing.is_none() && peer.is_none() {
+                        continue;
+                    }
                     states.send_modify(|state| {
                         state.phase = Phase::Failed;
                         state.rx_bytes_per_second = 0;
@@ -260,6 +278,9 @@ async fn run_connection(
                     continue;
                 }
                 if status == PeerStatus::Initiator {
+                    if pairing.is_none() {
+                        continue;
+                    }
                     states.send_modify(|state| state.phase = Phase::SecureSession);
                     continue;
                 }
@@ -473,7 +494,7 @@ async fn run_connection(
                 else {
                     continue;
                 };
-                if record.len() > ql_router::protocol::MAX_RECORD_SIZE {
+                if record.len() > ql_relay::MAX_RECORD_SIZE {
                     tracing::warn!(
                         bytes = record.len(),
                         "Passport QL record exceeds router limit"
@@ -561,7 +582,7 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
             }
         };
         let (mut reader, mut writer) =
-            match ql_router::tokio::connect(ql_router::DEFAULT_ADDRESS, &router).await {
+            match ql_relay::connect(ql_relay::DEFAULT_ADDRESS, &router).await {
                 Ok(connection) => connection,
                 Err(error) => {
                     tracing::warn!(%error, "QL router unavailable");
@@ -573,7 +594,7 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
 
         'connected: loop {
             // keep the frame future alive while outbound messages are handled
-            let mut record = std::pin::pin!(ql_router::tokio::receive(&mut reader));
+            let mut record = std::pin::pin!(ql_relay::receive(&mut reader));
             loop {
                 let step = future::race(async { Step::Record(record.as_mut().await) }, async {
                     Step::Outbound(outbound.recv().await)
@@ -594,10 +615,10 @@ async fn run_router(connection: Connection, mut outbound: mpsc::Receiver<RouterM
                     Step::Outbound(Some(message)) => {
                         let result = match message {
                             RouterMessage::Record(record) => {
-                                ql_router::tokio::send(&mut writer, &record).await
+                                ql_relay::send(&mut writer, &record).await
                             }
                             RouterMessage::Attach(peer) => {
-                                ql_router::tokio::attach(&mut writer, &peer).await
+                                ql_relay::attach(&mut writer, &peer).await
                             }
                         };
                         if let Err(error) = result {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["desktop-relay", "foundation-server", "ql-router"]
+members = ["desktop-relay", "foundation-server", "relay-ping-pong"]
 
 [workspace.package]
 edition = "2024"
@@ -11,14 +11,14 @@ async-channel = "2"
 dashmap = "6"
 figment = { version = "0.10", features = ["env"] }
 hex = "0.4"
-ql-api = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
-ql-codec = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
-ql-common = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
-ql-fsm = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
-ql-router = { path = "ql-router", default-features = false, features = ["tokio"] }
-ql-rpc = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f" }
-ql-runtime = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f", features = ["rpc"] }
-ql-wire = { git = "https://github.com/Foundation-Devices/foundation-api.git", rev = "00f74e6df83cc44642262a0089722b04cdcf963f", features = ["test-utils"] }
+ql-api = { path = "../foundation-api/ql-api" }
+ql-codec = { path = "../foundation-api/ql-codec" }
+ql-common = { path = "../foundation-api/ql-common" }
+ql-fsm = { path = "../foundation-api/ql-fsm" }
+ql-relay = { path = "../foundation-api/ql-relay" }
+ql-rpc = { path = "../foundation-api/ql-rpc" }
+ql-runtime = { path = "../foundation-api/ql-runtime", features = ["rpc"] }
+ql-wire = { path = "../foundation-api/ql-wire", features = ["test-utils"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }

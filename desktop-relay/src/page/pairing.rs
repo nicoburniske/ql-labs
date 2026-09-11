@@ -17,6 +17,7 @@ use rxing::{
     common::HybridBinarizer,
 };
 
+use super::render_button;
 use crate::{connection, theme};
 
 pub struct Page {
@@ -71,7 +72,8 @@ impl Page {
                 frame.height,
             )));
         }
-        let target = self.target.take();
+        let found = self.target.is_some();
+        let mut start = false;
 
         ui.clear();
         let mut root = ui
@@ -155,13 +157,28 @@ impl Page {
                             .text_weight(600),
                     );
                     status.add(
-                        Text::new("Looking for a pairing QR code…")
+                        Text::new(if found {
+                            "Pairing QR code found. Start pairing when ready."
+                        } else {
+                            "Looking for a pairing QR code…"
+                        })
                             .color(theme::TEXT)
                             .text_size(theme::TEXT_STATUS)
                             .wrap(TextWrap::Word)
                             .width(Sizing::grow()),
                     );
                 });
+                if found {
+                    start = details.add(|ui: &mut Ui| {
+                        render_button(
+                            ui,
+                            "Start pairing",
+                            "start pairing",
+                            theme::ACCENT_SUBTLE,
+                            theme::ACCENT,
+                        )
+                    });
+                }
             });
             cards.add(|ui: &mut Ui| {
                 let mut camera = ui
@@ -221,7 +238,7 @@ impl Page {
             });
         });
 
-        target
+        if start { self.target.take() } else { None }
     }
 }
 
