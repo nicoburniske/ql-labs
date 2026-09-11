@@ -1,16 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["relay-ping-pong", "relay-tui"]
-exclude = ["desktop-relay", "foundation-server"]
 
 [workspace.package]
 edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1"
-async-channel = "2"
-dashmap = "6"
-figment = { version = "0.10", features = ["env"] }
 hex = "0.4"
 ql-api = { path = "../foundation-api/ql-api" }
 ql-codec = { path = "../foundation-api/ql-codec" }
@@ -20,7 +16,4 @@ ql-relay = { path = "../foundation-api/ql-relay" }
 ql-rpc = { path = "../foundation-api/ql-rpc" }
 ql-runtime = { path = "../foundation-api/ql-runtime", features = ["rpc"] }
 ql-wire = { path = "../foundation-api/ql-wire", features = ["test-utils"] }
-serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
-tracing = { version = "0.1", default-features = false, features = ["std"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
