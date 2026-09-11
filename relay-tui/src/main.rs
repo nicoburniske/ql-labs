@@ -151,7 +151,9 @@ fn main() -> anyhow::Result<()> {
             .download::<DownloadBenchmark>()
             .build(rpc::Service { activity }),
     };
-    let (ql, handle) = new_runtime(identity.clone(), platform, RuntimeConfig::default());
+    let mut config = RuntimeConfig::default();
+    config.fsm.session.max_stream_receive_window = 128 * 1024;
+    let (ql, handle) = new_runtime(identity.clone(), platform, config);
     handle.arm_pairing(token);
     let mut app = App {
         relay: format!("connecting to {address}"),
@@ -497,7 +499,10 @@ fn main() -> anyhow::Result<()> {
                         .rpc()
                         .download::<DownloadPassportBenchmark>(
                             &DownloadBenchmarkParams { length },
-                            StreamOptions::default(),
+                            StreamOptions {
+                                receive_window: Some(128 * 1024),
+                                ..StreamOptions::default()
+                            },
                         )
                         .await?;
                     let (header, mut parts) = download.start().await?;
