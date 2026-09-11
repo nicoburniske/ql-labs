@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["desktop-relay", "foundation-server", "relay-ping-pong"]
+members = ["relay-ping-pong", "relay-tui"]
+exclude = ["desktop-relay", "foundation-server"]
 
 [workspace.package]
 edition = "2024"

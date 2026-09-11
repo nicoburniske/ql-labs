@@ -4,33 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
-[features]
-default = ["server"]
-server = [
-    "tokio",
-    "dep:anyhow",
-    "dep:dashmap",
-    "dep:figment",
-    "dep:futures-lite",
-    "dep:hex",
-    "dep:serde",
-    "dep:socket2",
-    "dep:tracing",
-    "dep:tracing-subscriber",
-]
-tokio = ["dep:tokio"]
-
-[[bin]]
-name = "ql-router"
-path = "src/main.rs"
-required-features = ["server"]
-
-[[test]]
-name = "tcp"
-required-features = ["server"]
-
 [dependencies]
-anyhow = { workspace = true, optional = true }
+anyhow.workspace = true
 bytes = "1"
 hex.workspace = true
 ql-codec.workspace = true

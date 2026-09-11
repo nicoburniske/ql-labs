@@ -1,0 +1,27 @@
+[package]
+name = "relay-tui"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+blit = { git = "https://github.com/nicoburniske/blit.git", branch = "master" }
+blit-executor = { git = "https://github.com/nicoburniske/blit.git", branch = "master" }
+blit-tui = { git = "https://github.com/nicoburniske/blit.git", branch = "master" }
+bytes = "1"
+hex.workspace = true
+ql-api.workspace = true
+ql-codec.workspace = true
+ql-common.workspace = true
+ql-fsm.workspace = true
+ql-keyos = { path = "../../foundation-api/ql-keyos" }
+ql-relay.workspace = true
+ql-rpc.workspace = true
+ql-runtime.workspace = true
+ql-wire.workspace = true
+qrcode = { version = "0.14", default-features = false }
+rustix = { version = "1", features = ["event"] }
+sha2 = "0.10"
+signal-hook = "0.3"
+tokio.workspace = true
