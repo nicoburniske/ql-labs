@@ -31,19 +31,17 @@ use ql_api::{
 use ql_codec::{Decode, Encode};
 use ql_fsm::PeerStatus;
 use ql_runtime::{PairingInvite, RuntimeConfig, RuntimeHandle, StreamOptions, new_runtime};
-use ql_wire::{
-    PairingToken, PeerBundle, QlRandom, SoftwareCrypto, answer_peer_challenge, generate_identity,
-};
+use ql_wire::{PairingToken, PeerBundle, QlRandom, SoftwareCrypto, generate_identity};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
 
 struct App {
-    relay: String,
+    router: String,
     peer: PeerStatus,
     peer_details: Option<PeerBundle>,
     handle: RuntimeHandle,
-    relay_connected: bool,
+    router_connected: bool,
     echo: String,
     echo_input: text_input::State,
     download_size: String,
@@ -59,15 +57,15 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let address = args
         .next()
-        .unwrap_or_else(|| "relay.foundation.xyz:7447".into());
+        .unwrap_or_else(|| "router.foundation.xyz:7447".into());
     let bundle_path = args.next().unwrap_or_else(|| "bundle.bin".into());
     ensure!(
         args.next().is_none(),
-        "usage: relay-tui [relay:port] [bundle.bin]"
+        "usage: router-tui [router:port] [bundle.bin]"
     );
     let router = PeerBundle::decode_bytes(std::fs::read(bundle_path)?.as_slice())?;
     router.validate(&SoftwareCrypto)?;
-    let identity = generate_identity(&SoftwareCrypto, "relay-tui");
+    let identity = generate_identity(&SoftwareCrypto, "router-tui");
     let mut token = [0; PairingToken::SIZE];
     SoftwareCrypto.fill_random_bytes(&mut token);
     let token = PairingToken(token);
@@ -156,11 +154,11 @@ fn main() -> anyhow::Result<()> {
     let (ql, handle) = new_runtime(identity.clone(), platform, config);
     handle.arm_pairing(token);
     let mut app = App {
-        relay: format!("connecting to {address}"),
+        router: format!("connecting to {address}"),
         peer: PeerStatus::Disconnected,
         peer_details: None,
         handle,
-        relay_connected: false,
+        router_connected: false,
         echo: "hello Prime".into(),
         echo_input: Default::default(),
         download_size: "256".into(),
@@ -206,34 +204,24 @@ fn main() -> anyhow::Result<()> {
     });
     root.spawn(async move |cx| {
         let result: anyhow::Result<()> = async {
-            let (mut reader, mut writer) = ql_relay::connect(&address, &router).await?;
-            ql_relay::attach(&mut writer, &identity.bundle()).await?;
-            let challenge = ql_relay::receive(&mut reader)
-                .await?
-                .context("relay closed before challenge")?;
-            let (answer, pending) =
-                answer_peer_challenge(&SoftwareCrypto, &identity, router, &challenge)?;
-            ql_relay::send(&mut writer, &answer).await?;
-            let mut confirmation = ql_relay::receive(&mut reader)
-                .await?
-                .context("relay closed before confirmation")?;
-            pending.verify(&SoftwareCrypto, &mut confirmation)?;
+            let (mut reader, mut writer) = ql_router::connect(&address, &router).await?;
+            ql_router::attach(&mut reader, &mut writer, &identity, &router).await?;
 
             {
                 let mut app = cx.app();
-                app.relay = format!("Relay online · {address}");
-                app.relay_connected = true;
+                app.router = format!("Router online · {address}");
+                app.router_connected = true;
             }
             // receive is polled continuously until this entire connection ends
             let read = async {
-                while let Some(record) = ql_relay::receive(&mut reader).await? {
+                while let Some(record) = ql_router::receive(&mut reader).await? {
                     incoming.send(record).await?;
                 }
-                bail!("relay disconnected")
+                bail!("router disconnected")
             };
             let write = async {
                 while let Some(record) = outgoing.recv().await {
-                    ql_relay::send(&mut writer, &record).await?;
+                    ql_router::send(&mut writer, &record).await?;
                 }
                 bail!("QL runtime stopped")
             };
@@ -246,8 +234,8 @@ fn main() -> anyhow::Result<()> {
         .await;
         if let Err(error) = result {
             let mut app = cx.app();
-            app.relay = format!("disconnected: {error:#}");
-            app.relay_connected = false;
+            app.router = format!("disconnected: {error:#}");
+            app.router_connected = false;
             app.permitted = false;
             app.peer = PeerStatus::Disconnected;
         }
@@ -278,7 +266,7 @@ fn main() -> anyhow::Result<()> {
         let mut send = false;
         let mut download = false;
         let enabled =
-            app.relay_connected && app.peer == PeerStatus::Connected && app.permitted && !app.busy;
+            app.router_connected && app.peer == PeerStatus::Connected && app.permitted && !app.busy;
         frame.render_inputs(
             session.platform_mut(),
             info,
@@ -313,7 +301,7 @@ fn main() -> anyhow::Result<()> {
                     );
                     header
                         .child(flex::item().grow())
-                        .insert(Text::new(&app.relay).color(if app.relay_connected {
+                        .insert(Text::new(&app.router).color(if app.router_connected {
                             Color::LIGHT_GREEN
                         } else {
                             Color::YELLOW
@@ -352,7 +340,7 @@ fn main() -> anyhow::Result<()> {
                                             .justify(Justify::Center),
                                     )
                                     .clip(BoundsClip);
-                                if app.relay_connected && app.peer_details.is_none() {
+                                if app.router_connected && app.peer_details.is_none() {
                                     slot.child(flex::item().fixed(28.0, 14.0))
                                         .insert(Image::new(qr_image.id(), Size::new(28.0, 14.0)));
                                 } else {

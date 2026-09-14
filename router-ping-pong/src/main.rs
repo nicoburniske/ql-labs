@@ -7,7 +7,7 @@ use anyhow::{Context, bail, ensure};
 use ql_codec::Decode;
 use ql_fsm::PeerStatus;
 use ql_runtime::{QlStreamError, RuntimeConfig, RuntimeHandle, StreamOptions, new_runtime};
-use ql_wire::{PeerBundle, QlIdentity, SoftwareCrypto, answer_peer_challenge, generate_identity};
+use ql_wire::{PeerBundle, QlIdentity, SoftwareCrypto, generate_identity};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinSet,
@@ -22,16 +22,16 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let address = args
         .next()
-        .unwrap_or_else(|| "relay.foundation.xyz:7447".into());
+        .unwrap_or_else(|| "router.foundation.xyz:7447".into());
     let bundle_path = args.next().unwrap_or_else(|| "bundle.bin".into());
     ensure!(
         args.next().is_none(),
-        "usage: relay-ping-pong [relay:port] [bundle.bin]"
+        "usage: router-ping-pong [router:port] [bundle.bin]"
     );
-    let bytes = std::fs::read(&bundle_path).context("read relay public bundle")?;
-    let relay = PeerBundle::decode_bytes(bytes.as_slice())?;
-    relay.validate(&SoftwareCrypto)?;
-    println!("relay: {address} ({})", hex::encode(relay.qid.0));
+    let bytes = std::fs::read(&bundle_path).context("read router public bundle")?;
+    let router = PeerBundle::decode_bytes(bytes.as_slice())?;
+    router.validate(&SoftwareCrypto)?;
+    println!("router: {address} ({})", hex::encode(router.qid.0));
 
     let alice = generate_identity(&SoftwareCrypto, "alice");
     let bob = generate_identity(&SoftwareCrypto, "bob");
@@ -42,9 +42,9 @@ async fn main() -> anyhow::Result<()> {
 
     let exchange = async {
         let (alice, mut alice_status) =
-            start_peer(alice, &relay, &address, completed_tx.clone(), &mut tasks).await?;
+            start_peer(alice, &router, &address, completed_tx.clone(), &mut tasks).await?;
         let (bob, mut bob_status) =
-            start_peer(bob, &relay, &address, completed_tx, &mut tasks).await?;
+            start_peer(bob, &router, &address, completed_tx, &mut tasks).await?;
 
         // simulate bundles saved during an earlier pairing
         alice.bind_peer(bob_bundle);
@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
     // setup and exchange share a deadline so a broken connection cannot hang the example
     timeout(Duration::from_secs(180), exchange)
         .await
-        .context("relay ping/pong timed out")??;
+        .context("router ping/pong timed out")??;
     tasks.shutdown().await;
     println!("verified all 6 ping responses and 4 byte transfers");
     Ok(())
@@ -138,24 +138,14 @@ async fn main() -> anyhow::Result<()> {
 
 async fn start_peer(
     identity: QlIdentity,
-    relay: &PeerBundle,
+    router: &PeerBundle,
     address: &str,
     completed: mpsc::Sender<Result<(), QlStreamError>>,
     tasks: &mut JoinSet<anyhow::Result<()>>,
 ) -> anyhow::Result<(RuntimeHandle, watch::Receiver<PeerStatus>)> {
     let name = identity.bundle().name;
-    let (mut reader, mut writer) = ql_relay::connect(address, relay).await?;
-    ql_relay::attach(&mut writer, &identity.bundle()).await?;
-    let challenge = ql_relay::receive(&mut reader)
-        .await?
-        .context("relay closed before challenge")?;
-    let (response, pending) =
-        answer_peer_challenge(&SoftwareCrypto, &identity, relay.clone(), &challenge)?;
-    ql_relay::send(&mut writer, &response).await?;
-    let mut confirmation = ql_relay::receive(&mut reader)
-        .await?
-        .context("relay closed before confirmation")?;
-    pending.verify(&SoftwareCrypto, &mut confirmation)?;
+    let (mut reader, mut writer) = ql_router::connect(address, router).await?;
+    ql_router::attach(&mut reader, &mut writer, &identity, router).await?;
     println!("{name}: attached {}", hex::encode(identity.qid.0));
 
     let (outbound, mut outbound_rx) = mpsc::channel(64);
@@ -177,14 +167,14 @@ async fn start_peer(
     let (runtime, handle) = new_runtime(identity, platform, config);
     tasks.spawn(async move {
         let read = async {
-            while let Some(record) = ql_relay::receive(&mut reader).await? {
+            while let Some(record) = ql_router::receive(&mut reader).await? {
                 inbound_tx.send(record).await?;
             }
-            bail!("relay disconnected")
+            bail!("router disconnected")
         };
         let write = async {
             while let Some(record) = outbound_rx.recv().await {
-                ql_relay::send(&mut writer, &record).await?;
+                ql_router::send(&mut writer, &record).await?;
             }
             bail!("runtime outbound closed")
         };

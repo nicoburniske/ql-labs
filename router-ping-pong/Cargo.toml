@@ -1,5 +1,5 @@
 [package]
-name = "relay-ping-pong"
+name = "router-ping-pong"
 version = "0.1.0"
 edition.workspace = true
 publish = false
@@ -11,7 +11,7 @@ hex.workspace = true
 ql-codec.workspace = true
 ql-common.workspace = true
 ql-fsm.workspace = true
-ql-relay.workspace = true
+ql-router.workspace = true
 ql-rpc.workspace = true
 ql-runtime.workspace = true
 ql-wire.workspace = true

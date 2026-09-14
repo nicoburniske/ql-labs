@@ -1,15 +1,15 @@
-# relay-tui
+# router-tui
 
 A single QL peer with pairing, echo, and the same generated download benchmark
-used by KeyOS `gui-app-qlv2`. All peer traffic goes through the relay.
+used by KeyOS `gui-app-qlv2`. All peer traffic goes through the router.
 
 From the workspace root, in Kitty or Ghostty:
 
 ```sh
-cargo run -p relay-tui -- relay.foundation.xyz:7447 ../foundation_app/bundle.bin
+cargo run -p router-tui -- router.foundation.xyz:7447 ../foundation_app/bundle.bin
 ```
 
-Arguments are optional and default to `relay.foundation.xyz:7447` and `bundle.bin`.
+Arguments are optional and default to `router.foundation.xyz:7447` and `bundle.bin`.
 Use the workspace's pinned nightly toolchain. Blit comes from Git `master` and
 the lockfile records the tested commit. Allow roughly 80 columns and 30 rows
 to show the pairing image and all controls together. The image occupies a fixed
@@ -17,7 +17,7 @@ to show the pairing image and all controls together. The image occupies a fixed
 
 1. Connect Prime to foundation_app and wait for KeyOS to log `router ready`.
 2. Open the updated QL v2 Test app on Prime and choose **Scan Peer QR**.
-3. Scan the TUI image. Prime pairs through the relay and selects the new peer.
+3. Scan the TUI image. Prime pairs through the router and selects the new peer.
 4. Use either side's echo/download controls. The TUI requests only the debug
    app permission needed for its requests to Prime. The QR contains only the
    hex-encoded pairing invite, not an onboarding URL.

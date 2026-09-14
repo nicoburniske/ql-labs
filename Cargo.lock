@@ -666,6 +666,7 @@ dependencies = [
 [[package]]
 name = "ql-api"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#c40ea7dc280b454f8a513ea8337726ac8df6f431"
 dependencies = [
  "bytes",
  "ciborium",
@@ -678,6 +679,7 @@ dependencies = [
 [[package]]
 name = "ql-codec"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#c40ea7dc280b454f8a513ea8337726ac8df6f431"
 dependencies = [
  "bytes",
 ]
@@ -685,6 +687,7 @@ dependencies = [
 [[package]]
 name = "ql-common"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#c40ea7dc280b454f8a513ea8337726ac8df6f431"
 dependencies = [
  "bytes",
  "ql-codec",
@@ -693,6 +696,7 @@ dependencies = [
 [[package]]
 name = "ql-fsm"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#c40ea7dc280b454f8a513ea8337726ac8df6f431"
 dependencies = [
  "bytes",
  "indexmap",
@@ -704,6 +708,7 @@ dependencies = [
 [[package]]
 name = "ql-keyos"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#c40ea7dc280b454f8a513ea8337726ac8df6f431"
 dependencies = [
  "bytes",
  "ql-codec",
@@ -712,11 +717,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ql-relay"
+name = "ql-router"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#c40ea7dc280b454f8a513ea8337726ac8df6f431"
 dependencies = [
  "bytes",
  "ql-codec",
+ "ql-common",
  "ql-wire",
  "tokio",
 ]
@@ -724,6 +731,7 @@ dependencies = [
 [[package]]
 name = "ql-rpc"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#c40ea7dc280b454f8a513ea8337726ac8df6f431"
 dependencies = [
  "bytes",
  "ql-common",
@@ -733,6 +741,7 @@ dependencies = [
 [[package]]
 name = "ql-runtime"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#c40ea7dc280b454f8a513ea8337726ac8df6f431"
 dependencies = [
  "async-channel",
  "bytes",
@@ -748,6 +757,7 @@ dependencies = [
 [[package]]
 name = "ql-wire"
 version = "0.1.0"
+source = "git+https://github.com/Foundation-Devices/foundation-api.git?branch=ql-v2-shared-api#c40ea7dc280b454f8a513ea8337726ac8df6f431"
 dependencies = [
  "bytes",
  "getrandom 0.2.17",
@@ -815,7 +825,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "relay-ping-pong"
+name = "router-ping-pong"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -824,7 +834,7 @@ dependencies = [
  "ql-codec",
  "ql-common",
  "ql-fsm",
- "ql-relay",
+ "ql-router",
  "ql-rpc",
  "ql-runtime",
  "ql-wire",
@@ -832,7 +842,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "relay-tui"
+name = "router-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -846,7 +856,7 @@ dependencies = [
  "ql-common",
  "ql-fsm",
  "ql-keyos",
- "ql-relay",
+ "ql-router",
  "ql-rpc",
  "ql-runtime",
  "ql-wire",

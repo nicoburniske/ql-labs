@@ -1,5 +1,5 @@
 [package]
-name = "relay-tui"
+name = "router-tui"
 version = "0.1.0"
 edition.workspace = true
 publish = false
@@ -15,8 +15,8 @@ ql-api.workspace = true
 ql-codec.workspace = true
 ql-common.workspace = true
 ql-fsm.workspace = true
-ql-keyos = { path = "../../foundation-api/ql-keyos" }
-ql-relay.workspace = true
+ql-keyos.workspace = true
+ql-router.workspace = true
 ql-rpc.workspace = true
 ql-runtime.workspace = true
 ql-wire.workspace = true
